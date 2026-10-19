@@ -1,19 +1,17 @@
 ---
 name: soc2-audit
 description: >-
-  Execute a comprehensive, framework-agnostic SOC 2 readiness audit of an
-  entire repository or application. Detects project type and stack at runtime
-  and adapts evidence gathering accordingly. Inspects the whole project for
-  observable evidence of AICPA Trust Services Criteria controls (Common
-  Criteria CC1-CC9 plus the optional Availability, Confidentiality, Processing
-  Integrity, and Privacy categories), organized around eleven control families
-  (A-K). For every control it records a Status (met / partial / gap /
-  organizational) with concrete evidence and an ownership lane
-  (platform-auditable / organizational / client-CUEC), scores readiness per
-  control family, lists gaps mapped to criteria references, and produces a
-  prioritized remediation plan with an overall readiness score /100 and a
-  readiness band. Read-only and evidence-based: never invents controls; absent
-  evidence is a Gap; secret values are always redacted.
+  Execute a comprehensive, framework-agnostic SOC 2 readiness audit of a
+  repository or application. Detects the stack at runtime and inspects the
+  project for observable evidence of AICPA Trust Services Criteria controls
+  (Common Criteria CC1-CC9 plus optional Availability, Confidentiality,
+  Processing Integrity, and Privacy), organized into eleven control families
+  (A-K). Records a Status (met / partial / gap / organizational) and an
+  ownership lane (platform-auditable / organizational / client-CUEC) per
+  control, scores each family, maps gaps to criteria, and produces a
+  prioritized remediation plan with a readiness score /100 and band.
+  Read-only and evidence-based: never invents controls; absent evidence is a
+  Gap; secrets are redacted.
   Use when the user asks for a SOC 2 audit, SOC 2 readiness assessment, Trust
   Services Criteria review, compliance gap analysis, or audit-readiness check.
   Triggers on: 'soc 2 audit', 'soc2 readiness', 'trust services criteria audit',
@@ -399,7 +397,7 @@ The orchestrator reads this SKILL.md for scope context, then fans out to evidenc
 | `agents/access-analyzer.md` | mid | `references/access-management.md` (step 3, family C) + `references/data-protection.md` (step 4, family D) | `reports/.artifacts/soc2-audit/step_03_soc2_access_management.md`, `reports/.artifacts/soc2-audit/step_04_soc2_data_protection.md` |
 | `agents/pipeline-analyzer.md` | mid | `references/change-management.md` (step 5, family E) + `references/infrastructure-network.md` (step 6, family F) | `reports/.artifacts/soc2-audit/step_05_soc2_change_management.md`, `reports/.artifacts/soc2-audit/step_06_soc2_infrastructure_network.md` |
 | `agents/risk-analyzer.md` | mid | `references/vulnerability-assurance.md` (step 7, families G/I/K) + `references/incident-resilience.md` (step 8, family H) | `reports/.artifacts/soc2-audit/step_07_soc2_vulnerability_assurance.md`, `reports/.artifacts/soc2-audit/step_08_soc2_incident_resilience.md` |
-| `agents/report-writer.md` | frontier | `references/scoring.md` (step 9) + `references/report-generator.md` (step 10) + `references/report-format-enforcer.md` (step 11) + `assets/report-template.md` | `reports/<YYYY-MM-DD>-<project>-soc2-audit.md`, `reports/<YYYY-MM-DD>-<project>-soc2-audit.json`, `reports/.history/last_scores.json` |
+| `agents/report-writer.md` | frontier | `references/scoring.md` (step 9) + `references/report-generator.md` (step 10) + `references/report-format-enforcer.md` (step 11) + `assets/report-template.md` | `reports/<YYYY-MM-DD>-<project>-soc2-audit.md`, `reports/<YYYY-MM-DD>-<project>-soc2-audit.json`, `reports/.history/last_soc2_scores.json` |
 
 **Model tiers** are provider-neutral symbolic names. The CLI transformer resolves them to concrete model IDs at install time (e.g. for Claude: cheap→haiku, mid→sonnet, frontier→opus).
 
@@ -440,7 +438,7 @@ REPORT="reports/$(date +%F)-$(printf '%s' "$REPO" \
 Everywhere this skill writes `reports/<YYYY-MM-DD>-<project>-soc2-audit.md`, it
 means that resolved path.
 
-The JSON export uses the same base name with a `.json` extension. `reports/.history/last_scores.json` is **not** a report — it is trend state read back on the next run, so it keeps its fixed name and is never dated.
+The JSON export uses the same base name with a `.json` extension. `reports/.history/last_soc2_scores.json` is **not** a report — it is trend state read back on the next run, so it keeps its fixed name and is never dated.
 
 **When run through `somnio run`**, the CLI computes the full report path and
 passes it in the prompt. Use the path it gives you verbatim — do not recompute
@@ -450,18 +448,30 @@ it, or the runner will not find the report and the step will fail.
 
 Every generated report MUST include a metadata block at the very end. This is non-negotiable — never omit it.
 
-To resolve the source and version:
-1. Look for `.claude-plugin/plugin.json` by traversing up from this skill's directory
-2. If found, read `name` and `version` from that file (plugin context)
-3. If not found, use `Somnio CLI` as the name and `unknown` as the version (CLI context)
+Copy the `Report Metadata` table from the template as the last block of the report. Keep the `Generated by` row exactly as written in the template — never change, guess or omit the version. Fill the remaining rows as described.
 
 Include this block at the very end of the report:
 
+```markdown
+## 19. Report Metadata
+
+| Field | Value |
+|-------|-------|
+| Scan date | [Date] |
+| Project path | [Path] |
+| Project type | [Detected type] |
+| Framework | SOC 2 (AICPA TSC 2017, rev. 2022) |
+| Families scored | 10 (A-J); K reported as deliverables |
+| Overall readiness | [Score]/100 ([Band]) |
+| Total gaps | [P1/P2/P3 counts] |
+| Scan mode | Read-only, evidence-based |
+| Generated by | Somnio CLI v3.2.16 |
+| Skill | soc2-audit |
+| Somnio AI Tools | https://github.com/somnio-software/somnio-ai-tools |
 ```
----
-Generated by: [plugin name or "Somnio CLI"] v[version]
-Skill: soc2-audit
-Date: [YYYY-MM-DD]
-Somnio AI Tools: https://github.com/somnio-software/somnio-ai-tools
----
-```
+
+## Drive Upload (optional)
+
+Upload the report to the project's Google Drive folder **only when the user asks for it**: an `upload` argument (`/soc2-audit upload`), a request such as "and upload it to Drive", or `somnio run soc2-audit --upload`. Without that request, never upload anything.
+
+When it was requested, wait until the final report is written (in session, after the orchestrator returns), then read `references/drive-upload.md` and follow it **from the main session**, not from a subagent: subagents do not have the Google Drive MCP tools. If the audit did not produce a report, there is nothing to upload.

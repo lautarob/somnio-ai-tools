@@ -2,16 +2,16 @@
 name: dora-metrics
 description: >
   Fetches the DORA metrics Deployment Frequency and Lead Time for Changes, per
-  project and per repo, from the provider's API (GitHub, GitLab, or Bitbucket
-  — not local git). Use this skill whenever the user asks to run or update the
+  project and per repo, from the provider's API (GitHub, GitLab, Bitbucket, or
+  Azure DevOps — not local git). Use this skill whenever the user asks to run or update the
   DORA metrics, measure the deployment frequency or lead time of a project
   (e.g. "Example Project"), generate the biweekly metrics report, or asks how
   many deploys a project made or how long a change takes to reach production —
-  regardless of which of the three providers the project's repos live on.
+  regardless of which of the four providers the project's repos live on.
   Also trigger on phrases like: "run the DORA metrics", "metrics for
   Example Project", "deployment frequency for [project]", "lead time for
   [project]", "biweekly metrics report", "how many deploys did we do this
-  sprint", "add a GitLab/Bitbucket project to the DORA metrics".
+  sprint", "add a GitLab/Bitbucket/Azure DevOps project to the DORA metrics".
 allowed-tools: Read, Write, Edit, Bash, Agent
 ---
 
@@ -136,7 +136,7 @@ ask them directly for the missing details and add them to
   there; `"merge"` is fine).**
 - Optional: `api_base` for a self-hosted GitHub Enterprise or GitLab instance,
   if the repo isn't on github.com / gitlab.com. Not supported for Bitbucket
-  (Cloud only).
+  or Azure DevOps (cloud only).
 - Optional: a short note if there is anything non-obvious about the project
   (e.g. multi-repo across different orgs, deploys decoupled between repos,
   repos split across providers) — goes in a `"notes"` field on the project.
@@ -203,10 +203,12 @@ python3 scripts/dora_metrics.py --project "Example Project" --out-dir reports
 Available flags:
 - `--config`: path to the config (default: `config/projects.json`).
 - `--project`: exact project name (default: runs all projects in the config).
-- `--out-dir`: if passed, in addition to printing to stdout it saves one
+- `--out-dir`: **recommended whenever a report is wanted** (it stays optional). If passed, in addition to printing to stdout it saves one
   file per repo there — `YYYY-MM-DD-<repo>-dora-metrics.md` (the same summary as a readable
   file). Note this selects **where** to save, while `--project` selects **what**
-  to measure; the file name comes from the repo, not from the project.
+  to measure; the file name comes from the repo, not from the project. The
+  saved per-repo file is the artifact to share: upload it as written, one file
+  per repo, never merged.
 - `--branch <branch>`: one-off override of `prod_branch` for this run
   (requires `--project`). Does not modify the config — use only for one-off
   tests against a branch different from the configured one.
@@ -227,7 +229,7 @@ The only case that produces no report at all is a usage error — an unknown
 `--project`, `--branch`/`--deploy-source`/`--provider` passed without
 `--project`, an invalid `deploy_source` or `provider`, `deploy_source:
 "release"` on a bitbucket or azure repo, an azure repo not written as
-`organization/project/repository`, or `api_base` on a bitbucket repo — which
+`organization/project/repository`, or `api_base` on a bitbucket or azure repo — which
 prints an error to stderr and exits 1 before anything is measured.
 
 `config/projects.json` field reference (also documented in `README.md` for a
@@ -240,13 +242,13 @@ even if only `SKILL.md` itself made it into an install):
 | `window_days` | global | — (required) | Measurement window in days. |
 | `projects[].name` | project | — (required) | Name the project is looked up by (case-insensitive). |
 | `projects[].notes` | project | none | Free text: rationale or clarifications specific to that project. |
-| `repos[].repo` | repo | — (required) | Repo identifier, format depends on `provider`: `org/repo` (github), project path (gitlab), `workspace/repo_slug` (bitbucket). |
-| `repos[].provider` | repo | `"github"` | `"github"`, `"gitlab"`, or `"bitbucket"`. |
+| `repos[].repo` | repo | — (required) | Repo identifier, format depends on `provider`: `org/repo` (github), project path (gitlab), `workspace/repo_slug` (bitbucket), `organization/project/repository` (azure). |
+| `repos[].provider` | repo | `"github"` | `"github"`, `"gitlab"`, `"bitbucket"`, or `"azure"`. |
 | `repos[].type` | repo | `[]` | Informational list (web/mobile/backend), only used for display in the output. |
 | `repos[].prod_branch` | repo | — (required) | Production branch of that repo. |
-| `repos[].deploy_source` | repo | `"release"` (github/gitlab), `"tag"` (bitbucket) | `"release"` = Release with a semver tag (not available on Bitbucket). `"tag"` = plain tag with no Release, for projects that tag but don't publish Releases. |
+| `repos[].deploy_source` | repo | `"release"` (github/gitlab), `"tag"` (bitbucket/azure) | `"release"` = Release with a semver tag (not available on Bitbucket or Azure DevOps). `"tag"` = plain tag with no Release, for projects that tag but don't publish Releases. `"merge"` = every PR/MR merged into `prod_branch` inside the window is one deploy (any provider). |
 | `repos[].tag_pattern` | repo | the global `tag_pattern` | Override if that specific repo uses a different tag format (e.g. with a build number). |
-| `repos[].api_base` | repo | the provider's public API root | Self-hosted GitHub Enterprise or GitLab instance's API root. Not supported for bitbucket (Cloud only). |
+| `repos[].api_base` | repo | the provider's public API root | Self-hosted GitHub Enterprise or GitLab instance's API root. Not supported for bitbucket or azure (cloud only). |
 
 ### Step 5 — Report
 
@@ -302,6 +304,16 @@ step guarantees) are:
   missing or empty, it still renders the heading with an explicit line
   saying no guidance was available and naming
   `references/practice-guidance.md`, never inventing entries.
+- The reply **ends with a `## Report Metadata` table**, the very last block
+  (a "Saved to" line goes before it). The script writes the same table at the
+  end of every saved `.md` file. It is a fixed, run-invariant block, not a
+  reading of the numbers, so it does not conflict with "report only what is in
+  the JSON": the `report-writer` builds it from the JSON's `skill`,
+  `generator_version`, `generated_at` (date part) and `window_days`. Its rows
+  are `Generated by` (`Somnio CLI v<generator_version>`), `Skill`
+  (`dora-metrics`), `Date`, `Measurement window` (`N days`) and `Somnio AI
+  Tools` (the repository URL). Keep `Generated by` and `Skill` exactly as
+  written, because the reports pipeline reads them.
 
 ---
 
@@ -334,9 +346,10 @@ missing, it asks.
 - GitLab self-hosted: `merged_after`/`merged_before` filtering on the merge
   requests list requires GitLab >= 13.1; an older instance may need an
   upgrade for Lead Time to measure correctly.
-- GitLab tags: the API exposes only the target commit's date, not a separate
-  "tag creation" date (GitHub distinguishes an annotated tag's own tagging
-  date from the commit's date; GitLab does not).
+- GitLab tags: the script dates a tag by the tag's own `created_at` when the
+  API returns one (set for annotated tags, null for lightweight ones) and falls
+  back to the target commit's date otherwise. A lightweight tag created well
+  after its commit therefore reads as if it happened at commit time.
 - Bitbucket: no Releases API at all — every Bitbucket repo measures via plain
   tags (`deploy_source` is forced to `"tag"`). Its pull request object also
   has no direct "merged at" timestamp; the script uses the merge commit's date
@@ -345,10 +358,17 @@ missing, it asks.
   costs more API calls on Bitbucket than on GitHub/GitLab, since there is no
   server-side "merged between these dates" filter to push the window down to
   the provider.
-- Bitbucket Server/Data Center and GitHub Enterprise are out of scope beyond
-  the `api_base` override for GitHub Enterprise; Bitbucket is Cloud-only.
-- E2E tests (`tests/e2e/`) currently cover the GitHub path only — GitLab and
-  Bitbucket are covered by unit tests with mocked HTTP responses, not a live
+- Bitbucket deleted source branch/fork: the PR commits endpoint returns an empty
+  list once the source branch is deleted and a 404 when the source fork is
+  deleted; that PR is then excluded from Lead Time
+  (`pr_first_commit_unfetchable`), so teams that delete branches on merge can
+  see many exclusions or `no data in the window`.
+  Detail: `references/troubleshooting.md`.
+- Bitbucket Server/Data Center, Azure DevOps Server and GitHub Enterprise are
+  out of scope beyond the `api_base` override for GitHub Enterprise; Bitbucket
+  and Azure DevOps are cloud-only.
+- E2E tests (`tests/e2e/`) currently cover the GitHub path only — GitLab,
+  Bitbucket and Azure DevOps are covered by unit tests with mocked HTTP responses, not a live
   end-to-end run.
 
 ## Important notes

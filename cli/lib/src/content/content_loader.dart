@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:yaml/yaml.dart';
 
+import '../utils/bundle_file_filter.dart';
 import 'skill_bundle.dart';
 
 /// Parsed rule data from a YAML cursor rule file or Markdown reference file.
@@ -209,9 +210,10 @@ class ContentLoader {
 
     final files = <String>[];
     for (final entity in rulesDir.listSync(recursive: true)) {
-      if (entity is File) {
-        files.add(p.relative(entity.path, from: rulesDir.path));
-      }
+      if (entity is! File) continue;
+      final relativePath = p.relative(entity.path, from: rulesDir.path);
+      if (isIgnoredBundleFile(relativePath)) continue;
+      files.add(relativePath);
     }
     files.sort();
     return files;
@@ -258,6 +260,7 @@ class ContentLoader {
   /// # Rule Name
   ///
   /// > Description text
+  /// > may span several lines
   ///
   /// **File pattern**: `*`
   ///
@@ -281,7 +284,19 @@ class ContentLoader {
         if (name.isEmpty && line.startsWith('# ')) {
           name = line.substring(2).trim();
         } else if (description.isEmpty && line.startsWith('> ')) {
-          description = line.substring(2).trim();
+          // Consume the whole blockquote, keeping the original line breaks.
+          final quoted = <String>[];
+          while (i < lines.length && lines[i].startsWith('>')) {
+            final quoteLine = lines[i];
+            quoted.add(
+              quoteLine.startsWith('> ')
+                  ? quoteLine.substring(2)
+                  : quoteLine.substring(1),
+            );
+            i++;
+          }
+          i--; // The for loop advances past the last quoted line.
+          description = quoted.join('\n').trim();
         } else if (line.startsWith('**File pattern**: ')) {
           final patternMatch = RegExp(r'`([^`]+)`').firstMatch(line);
           if (patternMatch != null) {
@@ -290,8 +305,7 @@ class ContentLoader {
         } else if (line.trim() == '---' && name.isNotEmpty) {
           promptStart = i + 1;
           // Skip blank line after ---
-          if (promptStart < lines.length &&
-              lines[promptStart].trim().isEmpty) {
+          if (promptStart < lines.length && lines[promptStart].trim().isEmpty) {
             promptStart++;
           }
           break;

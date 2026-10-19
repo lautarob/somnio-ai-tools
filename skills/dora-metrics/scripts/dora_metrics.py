@@ -2,32 +2,41 @@
 """
 Fetching skill — DORA (Deployment Frequency + Lead Time for Changes)
 
-Source: the repo provider's API (GitHub REST + Search, GitLab, Bitbucket Cloud,
-Azure DevOps), NOT local git — lead time depends on the real first commit of
-each PR/MR, something only the provider's PR object guarantees reliably
-regardless of the merge strategy (including squash).
+Source: the repo's provider API — GitHub (REST + Search), GitLab (REST v4),
+Bitbucket Cloud (REST 2.0) or Azure DevOps (Git REST 7.1) — NOT local git:
+lead time depends on the real first commit of each PR/MR, something only the
+provider's PR/MR object guarantees reliably regardless of the merge strategy
+(including squash).
 
 Contract: it ONLY fetches and aggregates. It does not interpret or rank — that
 is a later step, outside the scope of this skill.
 
 Usage:
-    export GITHUB_TOKEN=ghp_xxx   # or a token with 'repo' (read) scope for the org's repos
+    export GITHUB_TOKEN=ghp_xxx   # or `gh auth login`; read access to the org's repos
+    export GITLAB_TOKEN=glpat-xxx # only if a repo has "provider": "gitlab" (or `glab auth login`)
+    export BITBUCKET_TOKEN=xxx    # only if a repo has "provider": "bitbucket"
+                                  # (or BITBUCKET_USERNAME + BITBUCKET_APP_PASSWORD)
+    export AZURE_DEVOPS_PAT=xxx   # only if a repo has "provider": "azure" (or `az login`)
     python3 dora_metrics.py [--config config/projects.json] [--project "Example Project"] [--out-dir reports]
-        [--branch branch] [--deploy-source release|tag] [--window-days N]
+        [--branch branch] [--deploy-source release|tag|merge] [--provider github|gitlab|bitbucket|azure]
+        [--window-days N]
+
+Provider configurable per repo (the "provider" field in the config, default
+"github"). A run can mix providers; each is measured with its own credential,
+and a provider with no credential only turns its own repos into
+`no_credential` stubs. Azure DevOps repos are identified as
+`organization/project/repository`.
 
 Deploy marker configurable per repo (the "deploy_source" field in the config,
-default "release"; "tag" on Bitbucket and Azure DevOps, which have no Releases
-API): "release" uses Releases (tag_name matches tag_pattern); "tag" uses plain
-git tags (without going through Releases), resolving the date via the tag
-object or the commit they point to, for projects that tag but don't publish
-Releases; "merge" treats every PR/MR merged into `prod_branch` as its own
-deploy — for repos where the integration branch deploys itself on every merge
-and nobody publishes releases or tags (lead time = first commit of the PR ->
-its merge).
-
-Provider configurable per repo ("provider": github | gitlab | bitbucket |
-azure, default github). Azure DevOps repos are identified as
-`organization/project/repository` and authenticate with a PAT.
+default "release" on GitHub/GitLab and "tag" on Bitbucket and Azure DevOps,
+which have no Releases API): "release" uses the provider's Releases (tag_name
+matches tag_pattern); "tag" uses plain git tags (without going through
+Releases), resolving the date via the commit they point to, for projects that
+tag but don't publish Releases; "merge" (any provider) treats every PR/MR
+merged into `prod_branch` inside the window as its own deploy, dated by its
+merge, with lead time = first commit of the PR/MR -> its merge — for
+integration branches that deploy themselves on every merge and publish
+neither releases nor tags.
 
 Known limitation (deploy_source=tag, or release with a lightweight tag pointing
 at the merge commit): the timestamp of that commit can differ by 1-2 seconds
@@ -57,6 +66,7 @@ import statistics
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import requests
 
@@ -64,76 +74,82 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import troubleshooting  # noqa: E402  (sibling module, loaded by path so the script stays runnable from anywhere)
 import practice_guidance  # noqa: E402  (sibling module, same reason)
 
+# Version of the Somnio CLI this script ships with. Kept in sync with
+# `packageVersion` in cli/lib/src/version.dart by `dart run tool/stamp_version.dart`
+# (run from cli/) and checked by cli/test/src/content/version_stamp_test.dart.
+SOMNIO_VERSION = "3.2.16"
+REPORT_TYPE = "dora-metrics"
+
 API_ROOT = "https://api.github.com"
+# GitLab REST v4 (https://docs.gitlab.com/api/rest/). A repo's `api_base`
+# replaces it for a self-hosted instance, so it is the full API root
+# (".../api/v4"), not the host alone.
 GITLAB_API_ROOT = "https://gitlab.com/api/v4"
+# Bitbucket Cloud REST 2.0 (https://developer.atlassian.com/cloud/bitbucket/rest/intro/).
+# Cloud only: `api_base` is rejected for bitbucket repos (validate_api_base).
 BITBUCKET_API_ROOT = "https://api.bitbucket.org/2.0"
+# Azure DevOps Services Git REST
+# (https://learn.microsoft.com/rest/api/azure/devops/git/). dev.azure.com only:
+# `api_base` is rejected for azure repos (validate_api_base), Azure DevOps
+# Server (on-premises) is out of scope.
 AZURE_API_ROOT = "https://dev.azure.com"
 AZURE_API_VERSION = "7.1"
 
-PROVIDERS = ("github", "gitlab", "bitbucket", "azure")
-PROVIDER_LABELS = {"github": "GitHub", "gitlab": "GitLab", "bitbucket": "Bitbucket", "azure": "Azure DevOps"}
-# Providers without a Releases API: "release" is not a valid deploy_source for them.
-PROVIDERS_WITHOUT_RELEASES = ("bitbucket", "azure")
-# What the provider calls a merged change — only used in messages.
-PROVIDER_PR_LABELS = {"github": "PRs", "gitlab": "MRs", "bitbucket": "PRs", "azure": "PRs"}
+DEFAULT_PROVIDER = "github"
+
+# Everything that differs between providers as plain data: the display label,
+# the default API root, what a reviewed change is called, and how published
+# and not-yet-published Releases read in a message (None: the provider has no
+# Releases API), and whether a repo may point it at another API root with
+# `api_base` (GitHub Enterprise, self-hosted GitLab). The functions that differ live in `_provider_api`, the one
+# dispatch point. GitHub's wording is the wording the script used before it
+# supported other providers, so a GitHub-only run reads exactly as it did.
+PROVIDERS = {
+    "github": {
+        "label": "GitHub", "api_root": API_ROOT,
+        "change": "PR", "changes": "PRs", "change_ref": "#",
+        "releases_label": "published Releases",
+        "unpublished_label": "drafts",
+        "api_base": True,
+    },
+    "gitlab": {
+        "label": "GitLab", "api_root": GITLAB_API_ROOT,
+        "change": "MR", "changes": "MRs", "change_ref": "!",
+        "releases_label": "published GitLab Releases",
+        "unpublished_label": "upcoming releases",
+        "api_base": True,
+    },
+    "bitbucket": {
+        "label": "Bitbucket", "api_root": BITBUCKET_API_ROOT,
+        "change": "PR", "changes": "PRs", "change_ref": "#",
+        "releases_label": None,
+        "unpublished_label": None,
+        "api_base": False,
+    },
+    "azure": {
+        "label": "Azure DevOps", "api_root": AZURE_API_ROOT,
+        "change": "PR", "changes": "PRs", "change_ref": "#",
+        "releases_label": None,
+        "unpublished_label": None,
+        "api_base": False,
+    },
+}
+VALID_PROVIDERS = tuple(PROVIDERS)
 
 
 def provider_label(provider: str) -> str:
-    return PROVIDER_LABELS.get(provider, provider)
+    return PROVIDERS[provider]["label"]
 
 
-def parse_iso_ts(s: str) -> datetime:
-    """Parses the ISO-8601 shapes the non-GitHub providers emit (trailing `Z`,
-    fractional seconds, explicit offsets) and normalizes to UTC. GitHub's
-    strict `%Y-%m-%dT%H:%M:%SZ` keeps using parse_ts."""
-    text = s.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    # Python accepts at most 6 fractional digits; Azure DevOps emits 7.
-    m = re.match(r"^(.*T\d{2}:\d{2}:\d{2})\.(\d+)(.*)$", text)
-    if m:
-        text = f"{m.group(1)}.{m.group(2)[:6]}{m.group(3)}"
-    dt = datetime.fromisoformat(text)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+def repo_provider(repo_cfg: dict) -> str:
+    return repo_cfg.get("provider", DEFAULT_PROVIDER)
 
 
-def _json(resp):
-    """Azure DevOps answers with a UTF-8 BOM on some endpoints; `resp.json()`
-    chokes on it. Strips it before decoding."""
-    text = resp.text if isinstance(getattr(resp, "text", None), str) else ""
-    if text and text.lstrip().startswith("﻿"):
-        return json.loads(text.lstrip().lstrip("﻿"))
-    return resp.json()
-
-
-class ProviderError(Exception):
-    """Base of the per-provider API errors; build_result catches this."""
-
-
-class GitLabError(ProviderError):
-    pass
-
-
-class BitbucketError(ProviderError):
-    pass
-
-
-class AzureDevOpsError(ProviderError):
-    pass
-
-
-# --- Credentials -------------------------------------------------------------
-
-def get_gitlab_token():
-    """1) GITLAB_TOKEN env var, 2) `glab auth token` (logged-in GitLab CLI)."""
-    env_token = os.environ.get("GITLAB_TOKEN")
-    if env_token:
-        return env_token
-    if shutil.which("glab"):
+def _cli_token(binary: str):
+    """`<binary> auth token`, if that CLI is installed and logged in locally."""
+    if shutil.which(binary):
         try:
-            out = subprocess.run(["glab", "auth", "token"], capture_output=True, text=True, timeout=10)
+            out = subprocess.run([binary, "auth", "token"], capture_output=True, text=True, timeout=10)
             token = out.stdout.strip()
             if out.returncode == 0 and token:
                 return token
@@ -142,9 +158,31 @@ def get_gitlab_token():
     return None
 
 
+def get_github_token():
+    """Precedence order: 1) GITHUB_TOKEN env var, 2) `gh auth token`
+    (if the GitHub CLI is installed and logged in locally). This way anyone on
+    the team who already uses `gh` day to day can run this skill without
+    generating or pasting a new token anywhere."""
+    env_token = os.environ.get("GITHUB_TOKEN")
+    if env_token:
+        return env_token
+    return _cli_token("gh")
+
+
+def get_gitlab_token():
+    """Same precedence as GitHub: 1) GITLAB_TOKEN env var, 2) `glab auth token`
+    (if the GitLab CLI is installed and logged in locally)."""
+    env_token = os.environ.get("GITLAB_TOKEN")
+    if env_token:
+        return env_token
+    return _cli_token("glab")
+
+
 def get_bitbucket_credential():
-    """1) BITBUCKET_TOKEN (bearer), 2) BITBUCKET_USERNAME + BITBUCKET_APP_PASSWORD
-    together (basic auth). Bitbucket Cloud has no CLI to fall back to."""
+    """1) BITBUCKET_TOKEN env var, sent as a Bearer token; 2) BITBUCKET_USERNAME
+    + BITBUCKET_APP_PASSWORD together, sent as Basic auth. Bitbucket has no CLI
+    to fall back on, so there is no third option. Half a Basic pair is no
+    credential at all."""
     token = os.environ.get("BITBUCKET_TOKEN")
     if token:
         return {"type": "bearer", "token": token}
@@ -155,14 +193,16 @@ def get_bitbucket_credential():
     return None
 
 
+# The Azure DevOps resource (application) ID the Azure CLI issues tokens for.
 AZURE_DEVOPS_RESOURCE_ID = "499b84ac-1321-427f-aa17-267ca6975798"
 
 
 def get_azure_credential():
     """1) AZURE_DEVOPS_PAT env var (a Personal Access Token with Code: Read),
-    2) `az account get-access-token` for the Azure DevOps resource (logged-in
-    Azure CLI). PATs are the documented path; the CLI token is a convenience
-    for people who already run `az login` day to day."""
+    sent as Basic auth with an empty username; 2) `az account get-access-token`
+    for the Azure DevOps resource (logged-in Azure CLI), sent as a Bearer
+    token. PATs are the documented path; the CLI token is a convenience for
+    people who already run `az login` day to day."""
     pat = os.environ.get("AZURE_DEVOPS_PAT")
     if pat:
         return {"type": "pat", "token": pat}
@@ -180,432 +220,39 @@ def get_azure_credential():
     return None
 
 
-def gitlab_session(token: str) -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"PRIVATE-TOKEN": token})
-    return s
-
-
-def bitbucket_session(credential: dict) -> requests.Session:
-    s = requests.Session()
-    if credential["type"] == "bearer":
-        s.headers.update({"Authorization": f"Bearer {credential['token']}"})
-    else:
-        s.auth = (credential["username"], credential["app_password"])
-    return s
-
-
-def azure_session(credential: dict) -> requests.Session:
-    s = requests.Session()
-    if credential["type"] == "pat":
-        s.auth = ("", credential["token"])
-    else:
-        s.headers.update({"Authorization": f"Bearer {credential['token']}"})
-    s.headers.update({"Accept": "application/json"})
-    return s
-
-
-# --- Pagination per provider --------------------------------------------------
-
-def _raise_for_status(resp, url: str, error_cls, label: str):
-    """Common status handling for the non-GitHub providers. The message shapes
-    are the ones classify_api_error matches on (prefix, never substring)."""
-    if resp.status_code == 401 or (label == "Azure DevOps" and resp.status_code == 203):
-        raise error_cls(f"401 Unauthorized. Check that the {label} credential is valid and can read the repo.")
-    if resp.status_code == 429 or (resp.status_code == 403 and "rate limit" in (resp.text or "").lower()):
-        raise error_cls(f"Rate limit reached: {(resp.text or '')[:300]}")
-    if resp.status_code == 404:
-        raise error_cls(f"404 Not Found at {url} — does the repo exist and does the credential have access?")
-    if not resp.ok:
-        raise error_cls(f"{label} API error {resp.status_code} at {url}: {(resp.text or '')[:300]}")
-
-
-def gitlab_paginate(session: requests.Session, url: str, params: dict = None):
-    """GET with Link-header pagination (GitLab), yielding items."""
-    params = dict(params or {})
-    params.setdefault("per_page", 100)
-    next_url, next_params = url, params
-    while next_url:
-        resp = session.get(next_url, params=next_params)
-        _raise_for_status(resp, next_url, GitLabError, "GitLab")
-        data = _json(resp)
-        for item in (data if isinstance(data, list) else [data]):
-            yield item
-        links = getattr(resp, "links", None) or {}
-        next_url = links.get("next", {}).get("url")
-        next_params = None
-
-
-def bitbucket_paginate(session: requests.Session, url: str, params: dict = None):
-    """GET with `next`-link pagination (Bitbucket Cloud), yielding `values`."""
-    params = dict(params or {})
-    params.setdefault("pagelen", 100)
-    next_url, next_params = url, params
-    while next_url:
-        resp = session.get(next_url, params=next_params)
-        _raise_for_status(resp, next_url, BitbucketError, "Bitbucket")
-        data = _json(resp)
-        if isinstance(data, dict):
-            for item in data.get("values", []):
-                yield item
-            next_url = data.get("next")
-        else:
-            for item in data:
-                yield item
-            next_url = None
-        next_params = None
-
-
-def azure_paginate(session: requests.Session, url: str, params: dict = None):
-    """GET with Azure DevOps pagination: `value` lists continued through the
-    `x-ms-continuationtoken` response header (refs, PRs) or `$skip` for the
-    endpoints that only support `$top`/`$skip` (pull requests)."""
-    params = dict(params or {})
-    params.setdefault("api-version", AZURE_API_VERSION)
-    use_skip = "$top" in params
-    skip = int(params.get("$skip", 0))
-    while True:
-        if use_skip:
-            params["$skip"] = skip
-        resp = session.get(url, params=params)
-        _raise_for_status(resp, url, AzureDevOpsError, "Azure DevOps")
-        data = _json(resp)
-        items = data.get("value", []) if isinstance(data, dict) else data
-        for item in items:
-            yield item
-        token = (getattr(resp, "headers", None) or {}).get("x-ms-continuationtoken")
-        if token:
-            params["continuationToken"] = token
-            continue
-        if use_skip and len(items) >= int(params["$top"]):
-            skip += len(items)
-            continue
-        return
-
-
-# --- GitLab -----------------------------------------------------------------
-
-def gitlab_project_id(path: str) -> str:
-    """GitLab addresses a project by its URL-encoded path (`group%2Fproject`)."""
-    from urllib.parse import quote
-    return quote(path, safe="")
-
-
-def get_gitlab_releases(session, project: str, tag_pattern: str, now: datetime = None, api_root: str = None):
-    """Published GitLab Releases whose tag matches tag_pattern, ascending.
-    An "upcoming" release (released_at in the future) is GitLab's draft."""
-    root = api_root or GITLAB_API_ROOT
-    now = now or datetime.now(timezone.utc)
-    pattern = re.compile(tag_pattern)
-    releases = []
-    for r in gitlab_paginate(session, f"{root}/projects/{gitlab_project_id(project)}/releases"):
-        tag = r.get("tag_name", "")
-        released = r.get("released_at") or r.get("created_at")
-        if not pattern.match(tag) or not released:
-            continue
-        published_at = parse_iso_ts(released)
-        if published_at > now:
-            continue
-        releases.append({"tag": tag, "published_at": published_at,
-                         "url": (r.get("_links") or {}).get("self")})
-    releases.sort(key=lambda x: x["published_at"])
-    return releases
-
-
-def get_gitlab_tags(session, project: str, tag_pattern: str, api_root: str = None):
-    """GitLab tags matching tag_pattern, dated by the commit they point to."""
-    root = api_root or GITLAB_API_ROOT
-    pattern = re.compile(tag_pattern)
-    tags = []
-    for t in gitlab_paginate(session, f"{root}/projects/{gitlab_project_id(project)}/repository/tags"):
-        name = t.get("name", "")
-        date_str = (t.get("commit") or {}).get("committed_date") or (t.get("commit") or {}).get("created_at")
-        if not pattern.match(name) or not date_str:
-            continue
-        tags.append({"tag": name, "published_at": parse_iso_ts(date_str), "url": None})
-    tags.sort(key=lambda x: x["published_at"])
-    return tags
-
-
-def get_gitlab_release_tag_names(session, project: str, api_root: str = None, now: datetime = None) -> dict:
-    """Tag names of every GitLab Release, upcoming ones reported as `draft`."""
-    root = api_root or GITLAB_API_ROOT
-    now = now or datetime.now(timezone.utc)
-    published, draft = [], []
-    for r in gitlab_paginate(session, f"{root}/projects/{gitlab_project_id(project)}/releases"):
-        name = r.get("tag_name", "")
-        if not name:
-            continue
-        released = r.get("released_at")
-        upcoming = bool(released) and parse_iso_ts(released) > now
-        (draft if upcoming else published).append(name)
-    return {"published": published, "draft": draft}
-
-
-def get_gitlab_all_tag_names(session, project: str, api_root: str = None) -> list:
-    root = api_root or GITLAB_API_ROOT
-    return [t.get("name", "") for t in gitlab_paginate(session, f"{root}/projects/{gitlab_project_id(project)}/repository/tags")
-            if t.get("name")]
-
-
-def get_gitlab_mr_first_commit_ts(session, project: str, mr_iid: int, api_root: str = None):
-    root = api_root or GITLAB_API_ROOT
-    dates = []
-    for c in gitlab_paginate(session, f"{root}/projects/{gitlab_project_id(project)}/merge_requests/{mr_iid}/commits"):
-        d = c.get("created_at") or c.get("authored_date") or c.get("committed_date")
-        if d:
-            dates.append(parse_iso_ts(d))
-    return min(dates) if dates else None
-
-
-def get_gitlab_merged_mrs_between(session, project: str, branch: str, start: datetime, end: datetime, api_root: str = None):
-    """MRs merged into `branch` in (start, end]. GitLab filters by `updated_after`
-    only, so the merge timestamp is checked here when the item carries it."""
-    root = api_root or GITLAB_API_ROOT
-    params = {"state": "merged", "target_branch": branch, "updated_after": start.isoformat(),
-              "order_by": "updated_at", "sort": "desc"}
-    mrs = []
-    for item in gitlab_paginate(session, f"{root}/projects/{gitlab_project_id(project)}/merge_requests", params=params):
-        merged = item.get("merged_at")
-        if merged:
-            merged_at = parse_iso_ts(merged)
-            if not (start < merged_at <= end):
-                continue
-        else:
-            merged_at = None
-        mrs.append({"number": item["iid"], "title": item.get("title", ""),
-                    **({"merged_at": merged_at, "url": item.get("web_url")} if merged_at else {})})
-    return mrs
-
-
-# --- Bitbucket Cloud ----------------------------------------------------------
-
-def get_bitbucket_tags(session, repo: str, tag_pattern: str, api_root: str = None):
-    """Bitbucket tags matching tag_pattern. An annotated tag carries its own
-    `date`; a lightweight one is dated by its target commit."""
-    root = api_root or BITBUCKET_API_ROOT
-    pattern = re.compile(tag_pattern)
-    tags = []
-    for t in bitbucket_paginate(session, f"{root}/repositories/{repo}/refs/tags"):
-        name = t.get("name", "")
-        date_str = t.get("date") or (t.get("target") or {}).get("date")
-        if not pattern.match(name) or not date_str:
-            continue
-        tags.append({"tag": name, "published_at": parse_iso_ts(date_str),
-                     "url": ((t.get("links") or {}).get("html") or {}).get("href")})
-    tags.sort(key=lambda x: x["published_at"])
-    return tags
-
-
-def get_bitbucket_all_tag_names(session, repo: str, api_root: str = None) -> list:
-    root = api_root or BITBUCKET_API_ROOT
-    return [t.get("name", "") for t in bitbucket_paginate(session, f"{root}/repositories/{repo}/refs/tags") if t.get("name")]
-
-
-def get_bitbucket_pr_first_commit_ts(session, repo: str, pr_id: int, api_root: str = None):
-    root = api_root or BITBUCKET_API_ROOT
-    dates = [parse_iso_ts(c["date"]) for c in bitbucket_paginate(session, f"{root}/repositories/{repo}/pullrequests/{pr_id}/commits")
-             if c.get("date")]
-    return min(dates) if dates else None
-
-
-def _bitbucket_pr_merged_at(session, repo: str, pr_item: dict, api_root: str):
-    """Bitbucket's PR object has no merged_at: the merge commit's date is the
-    closest thing, with `updated_on` as the fallback."""
-    merge_hash = (pr_item.get("merge_commit") or {}).get("hash")
-    if merge_hash:
-        resp = session.get(f"{api_root}/repositories/{repo}/commit/{merge_hash}")
-        if getattr(resp, "ok", False):
-            data = _json(resp)
-            if isinstance(data, dict) and data.get("date"):
-                return parse_iso_ts(data["date"])
-    return parse_iso_ts(pr_item["updated_on"]) if pr_item.get("updated_on") else None
-
-
-def get_bitbucket_merged_prs_between(session, repo: str, branch: str, start: datetime, end: datetime, api_root: str = None):
-    """PRs merged into `branch` in (start, end]."""
-    root = api_root or BITBUCKET_API_ROOT
-    params = {"state": "MERGED", "q": f'destination.branch.name="{branch}"', "sort": "-updated_on"}
-    prs = []
-    for item in bitbucket_paginate(session, f"{root}/repositories/{repo}/pullrequests", params=params):
-        updated = item.get("updated_on")
-        if updated and parse_iso_ts(updated) < start:
-            break  # sorted by updated_on desc: nothing older can be inside the window
-        merged_at = _bitbucket_pr_merged_at(session, repo, item, root)
-        if merged_at is None or not (start < merged_at <= end):
-            continue
-        prs.append({"number": item["id"], "title": item.get("title", ""), "merged_at": merged_at,
-                    "url": ((item.get("links") or {}).get("html") or {}).get("href")})
-    return prs
-
-
-# --- Azure DevOps -------------------------------------------------------------
-
-def azure_repo_parts(repo: str):
-    """`organization/project/repository` -> (org, project, repository). The
-    project and repository names may hold spaces or dots; they are URL-quoted
-    where they appear in a path."""
-    parts = repo.split("/")
-    if len(parts) != 3 or not all(parts):
-        raise ValueError(f"Azure DevOps repos are identified as organization/project/repository, got {repo!r}.")
-    return parts[0], parts[1], parts[2]
-
-
-def _azure_repo_url(repo: str, api_root: str = None) -> str:
-    from urllib.parse import quote
-    org, project, name = azure_repo_parts(repo)
-    root = api_root or AZURE_API_ROOT
-    return f"{root}/{quote(org, safe='')}/{quote(project, safe='')}/_apis/git/repositories/{quote(name, safe='')}"
-
-
-def get_azure_tags(session, repo: str, tag_pattern: str, api_root: str = None):
-    """Azure DevOps tags matching tag_pattern. An annotated tag (peeledObjectId
-    present) is dated by its tag object; a lightweight one by its commit."""
-    base = _azure_repo_url(repo, api_root)
-    pattern = re.compile(tag_pattern)
-    tags = []
-    for ref in azure_paginate(session, f"{base}/refs", params={"filter": "tags/"}):
-        name = (ref.get("name") or "").replace("refs/tags/", "", 1)
-        if not pattern.match(name):
-            continue
-        date_str, url = None, None
-        if ref.get("peeledObjectId"):
-            resp = session.get(f"{base}/annotatedtags/{ref['objectId']}", params={"api-version": AZURE_API_VERSION})
-            if getattr(resp, "ok", False):
-                data = _json(resp)
-                date_str = ((data.get("taggedBy") or {}).get("date")) if isinstance(data, dict) else None
-                url = data.get("url") if isinstance(data, dict) else None
-            commit_id = ref["peeledObjectId"]
-        else:
-            commit_id = ref.get("objectId")
-        if not date_str and commit_id:
-            resp = session.get(f"{base}/commits/{commit_id}", params={"api-version": AZURE_API_VERSION})
-            if getattr(resp, "ok", False):
-                data = _json(resp)
-                if isinstance(data, dict):
-                    date_str = ((data.get("committer") or {}).get("date")) or ((data.get("author") or {}).get("date"))
-                    url = url or data.get("remoteUrl")
-        if not date_str:
-            continue
-        tags.append({"tag": name, "published_at": parse_iso_ts(date_str), "url": url})
-    tags.sort(key=lambda x: x["published_at"])
-    return tags
-
-
-def get_azure_all_tag_names(session, repo: str, api_root: str = None) -> list:
-    base = _azure_repo_url(repo, api_root)
-    return [(ref.get("name") or "").replace("refs/tags/", "", 1)
-            for ref in azure_paginate(session, f"{base}/refs", params={"filter": "tags/"}) if ref.get("name")]
-
-
-def get_azure_pr_first_commit_ts(session, repo: str, pr_id: int, api_root: str = None):
-    base = _azure_repo_url(repo, api_root)
-    dates = []
-    for c in azure_paginate(session, f"{base}/pullrequests/{pr_id}/commits"):
-        d = (c.get("author") or {}).get("date") or (c.get("committer") or {}).get("date")
-        if d:
-            dates.append(parse_iso_ts(d))
-    return min(dates) if dates else None
-
-
-def get_azure_merged_prs_between(session, repo: str, branch: str, start: datetime, end: datetime, api_root: str = None):
-    """Completed PRs into `branch` whose closedDate (= merge) is in (start, end].
-    The API returns them newest first and only supports $top/$skip paging."""
-    base = _azure_repo_url(repo, api_root)
-    params = {"searchCriteria.status": "completed", "searchCriteria.targetRefName": f"refs/heads/{branch}",
-              "$top": 100}
-    prs = []
-    for item in azure_paginate(session, f"{base}/pullrequests", params=params):
-        closed = item.get("closedDate")
-        if not closed:
-            continue
-        merged_at = parse_iso_ts(closed)
-        if merged_at < start:
-            break  # newest first: everything after this is older than the window
-        if not (start < merged_at <= end):
-            continue
-        prs.append({"number": item["pullRequestId"], "title": item.get("title", ""), "merged_at": merged_at,
-                    "url": item.get("url")})
-    return prs
-
-
-# --- Config helpers ----------------------------------------------------------
-
-def effective_deploy_source(repo_cfg: dict) -> str:
-    """Explicit `deploy_source` wins; otherwise "release", except on providers
-    without a Releases API (Bitbucket, Azure DevOps), which default to "tag"."""
-    explicit = repo_cfg.get("deploy_source")
-    if explicit:
-        return explicit
-    return "tag" if repo_cfg.get("provider", "github") in PROVIDERS_WITHOUT_RELEASES else "release"
-
-
-def validate_providers(projects) -> None:
-    for project in projects:
-        for repo_cfg in project["repos"]:
-            provider = repo_cfg.get("provider", "github")
-            if provider not in PROVIDERS:
-                raise ValueError(f"invalid provider '{provider}' in repo {repo_cfg['repo']} (valid: {', '.join(PROVIDERS)}).")
-            if provider == "azure":
-                azure_repo_parts(repo_cfg["repo"])
-
-
-def validate_api_base(projects) -> None:
-    """`api_base` (self-hosted GitHub Enterprise / GitLab) is not supported for
-    Bitbucket: only Bitbucket Cloud is."""
-    for project in projects:
-        for repo_cfg in project["repos"]:
-            if repo_cfg.get("api_base") and repo_cfg.get("provider") == "bitbucket":
-                raise ValueError(f"api_base is not supported for Bitbucket (repo {repo_cfg['repo']}): only Bitbucket Cloud is.")
-
-
-def classify_api_error(provider: str, repo: str, message: str) -> dict:
-    """Maps an exception raised mid-measurement onto a code, so an access
-    problem reaches the report with steps instead of as raw text.
-
-    Matches on the START of the message, never a substring search: the message
-    embeds the request URL (and, for the generic shape, the provider's response
-    body), so a repo named `org/app-401` would otherwise be reported as an auth
-    failure and its owner sent to reissue a perfectly good token. The prefixes
-    below are the shapes the paginators raise."""
-    label = provider_label(provider)
-    if message.startswith("401"):
-        return make_issue("token_unauthorized", "blocked",
-                          f"{repo}: 401 Unauthorized from the {label} API — the credential is not valid for this repo.")
-    if message.startswith("Rate limit reached"):
-        return make_issue("rate_limited", "blocked",
-                          f"{repo}: {label} API rate limit reached — it could not be measured in this run.")
-    if message.startswith("404"):
-        return make_issue("repo_unreachable", "blocked",
-                          f"{repo}: the {label} API returned 404 — the repo is unreachable with this credential, "
-                          "it could not be measured.",
-                          evidence={"status": 404})
-    return make_issue("api_error", "blocked", f"{repo}: {message}")
-
-
-
-
-def get_github_token():
-    """Precedence order: 1) GITHUB_TOKEN env var, 2) `gh auth token`
-    (if the GitHub CLI is installed and logged in locally). This way anyone on
-    the team who already uses `gh` day to day can run this skill without
-    generating or pasting a new token anywhere."""
-    env_token = os.environ.get("GITHUB_TOKEN")
-    if env_token:
-        return env_token
-    if shutil.which("gh"):
-        try:
-            out = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
-            token = out.stdout.strip()
-            if out.returncode == 0 and token:
-                return token
-        except Exception:
-            pass
-    return None
-
-
 class GitHubError(Exception):
     pass
+
+
+class _ProviderApiError(Exception):
+    """Base for the GitLab and Bitbucket errors. `status` keeps the HTTP
+    status (None when unknown), so a caller can tell a missing per-PR/MR
+    resource from a repo-wide failure without parsing the message."""
+
+    def __init__(self, message: str = "", status: int = None):
+        super().__init__(message)
+        self.status = status
+
+
+class GitLabError(_ProviderApiError):
+    pass
+
+
+class BitbucketError(_ProviderApiError):
+    pass
+
+
+class AzureDevOpsError(_ProviderApiError):
+    pass
+
+
+# Statuses that mean one PR/MR's commit list is gone or hidden, not that the
+# repo is unreachable: that single PR/MR is excluded and the repo is still
+# measured.
+_PER_CHANGE_MISSING_STATUSES = (403, 404)
+
+
+API_ERRORS = (GitHubError, GitLabError, BitbucketError, AzureDevOpsError)
 
 
 def gh_session(token: str) -> requests.Session:
@@ -615,6 +262,38 @@ def gh_session(token: str) -> requests.Session:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     })
+    return s
+
+
+def gitlab_session(token: str) -> requests.Session:
+    """GitLab REST auth via the PRIVATE-TOKEN header
+    (https://docs.gitlab.com/api/rest/authentication/)."""
+    s = requests.Session()
+    s.headers.update({"PRIVATE-TOKEN": token})
+    return s
+
+
+def bitbucket_session(credential: dict) -> requests.Session:
+    """Bearer for a repository/project/workspace access token, Basic for
+    username + app password
+    (https://developer.atlassian.com/cloud/bitbucket/rest/intro/)."""
+    s = requests.Session()
+    if credential["type"] == "bearer":
+        s.headers.update({"Authorization": f"Bearer {credential['token']}"})
+    else:
+        s.auth = (credential["username"], credential["app_password"])
+    return s
+
+
+def azure_session(credential: dict) -> requests.Session:
+    """Basic auth with an empty username for a PAT, Bearer for an Azure CLI
+    token (https://learn.microsoft.com/azure/devops/integrate/get-started/authentication/)."""
+    s = requests.Session()
+    if credential["type"] == "pat":
+        s.auth = ("", credential["token"])
+    else:
+        s.headers.update({"Authorization": f"Bearer {credential['token']}"})
+    s.headers.update({"Accept": "application/json"})
     return s
 
 
@@ -651,15 +330,37 @@ def parse_ts(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 
+_FRACTION_RE = re.compile(r"\.(\d+)")
+
+
+def parse_iso_ts(s: str) -> datetime:
+    """Any ISO 8601 timestamp the GitLab and Bitbucket APIs return — a `Z` or
+    a numeric offset, with or without fractional seconds — as an aware UTC
+    datetime. GitHub keeps parse_ts: its timestamps have one fixed shape.
+
+    The `Z` and the fraction are normalized first so this also parses on
+    Pythons older than 3.11, whose fromisoformat accepts neither a `Z` nor a
+    fraction that isn't 3 or 6 digits long."""
+    text = s.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    text = _FRACTION_RE.sub(lambda m: "." + m.group(1)[:6].ljust(6, "0"), text, count=1)
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def fmt_ts(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def get_prod_releases(session: requests.Session, repo: str, tag_pattern: str):
+def get_prod_releases(session: requests.Session, repo: str, tag_pattern: str, api_root: str = None):
     """Published Releases (not draft) whose tag matches tag_pattern, ascending order."""
+    root = api_root or API_ROOT
     pattern = re.compile(tag_pattern)
     releases = []
-    for r in gh_paginate(session, f"{API_ROOT}/repos/{repo}/releases"):
+    for r in gh_paginate(session, f"{root}/repos/{repo}/releases"):
         if r.get("draft"):
             continue
         tag = r.get("tag_name", "")
@@ -673,7 +374,7 @@ def get_prod_releases(session: requests.Session, repo: str, tag_pattern: str):
     return releases
 
 
-def get_prod_tags(session: requests.Session, repo: str, tag_pattern: str):
+def get_prod_tags(session: requests.Session, repo: str, tag_pattern: str, api_root: str = None):
     """Tags (without a Release) whose name matches tag_pattern, ascending order.
 
     Distinguishes an annotated tag from a lightweight one via the Git Data API:
@@ -682,19 +383,20 @@ def get_prod_tags(session: requests.Session, repo: str, tag_pattern: str):
     a bit later than when the code was written. Using the underlying commit's
     date directly (as we did before) lost that distinction. A lightweight tag
     has no object of its own, so it falls back to the commit's date."""
+    root = api_root or API_ROOT
     pattern = re.compile(tag_pattern)
-    tag_names = [t.get("name", "") for t in gh_paginate(session, f"{API_ROOT}/repos/{repo}/tags")]
+    tag_names = [t.get("name", "") for t in gh_paginate(session, f"{root}/repos/{repo}/tags")]
     tags = []
     for name in tag_names:
         if not pattern.match(name):
             continue
-        ref_resp = session.get(f"{API_ROOT}/repos/{repo}/git/ref/tags/{name}")
+        ref_resp = session.get(f"{root}/repos/{repo}/git/ref/tags/{name}")
         if not ref_resp.ok:
             continue
         obj = ref_resp.json().get("object", {})
         obj_sha = obj.get("sha")
         if obj.get("type") == "tag":
-            tag_resp = session.get(f"{API_ROOT}/repos/{repo}/git/tags/{obj_sha}")
+            tag_resp = session.get(f"{root}/repos/{repo}/git/tags/{obj_sha}")
             if not tag_resp.ok:
                 continue
             tag_data = tag_resp.json()
@@ -703,7 +405,7 @@ def get_prod_tags(session: requests.Session, repo: str, tag_pattern: str):
                 continue
             tags.append({"tag": name, "published_at": parse_ts(date_str), "url": tag_data.get("object", {}).get("url")})
         else:
-            commit_resp = session.get(f"{API_ROOT}/repos/{repo}/commits/{obj_sha}")
+            commit_resp = session.get(f"{root}/repos/{repo}/commits/{obj_sha}")
             if not commit_resp.ok:
                 continue
             commit_data = commit_resp.json()
@@ -716,10 +418,11 @@ def get_prod_tags(session: requests.Session, repo: str, tag_pattern: str):
     return tags
 
 
-def get_pr_first_commit_ts(session: requests.Session, repo: str, pr_number: int):
+def get_pr_first_commit_ts(session: requests.Session, repo: str, pr_number: int, api_root: str = None):
     """Timestamp of the PR's first commit (via the PR object, not the git log of
     main — this stays correct even if the merge to main was a squash)."""
-    commits = list(gh_paginate(session, f"{API_ROOT}/repos/{repo}/pulls/{pr_number}/commits"))
+    root = api_root or API_ROOT
+    commits = list(gh_paginate(session, f"{root}/repos/{repo}/pulls/{pr_number}/commits"))
     if not commits:
         return None
     dates = []
@@ -735,25 +438,18 @@ def get_pr_first_commit_ts(session: requests.Session, repo: str, pr_number: int)
     return min(dates)
 
 
-def get_pr_merged_at(session: requests.Session, repo: str, pr_number: int):
-    """merged_at of one PR, from the PR object (deploy_source "merge")."""
-    resp = session.get(f"{API_ROOT}/repos/{repo}/pulls/{pr_number}")
-    if not getattr(resp, "ok", False):
-        return None
-    data = _json(resp)
-    merged = data.get("merged_at") if isinstance(data, dict) else None
-    return parse_ts(merged) if merged else None
-
-
-def get_merged_prs_between(session: requests.Session, repo: str, branch: str, start: datetime, end: datetime):
+def get_merged_prs_between(session: requests.Session, repo: str, branch: str, start: datetime, end: datetime,
+                           api_root: str = None):
     """PRs merged to `branch` in (start, end], via the Search API (search/issues),
     regardless of the merge strategy (squash/merge commit/rebase)."""
     start_s = fmt_ts(start)
     end_s = fmt_ts(end)
     q = f"repo:{repo} is:pr is:merged base:{branch} merged:{start_s}..{end_s}"
     prs = []
-    for item in gh_paginate(session, f"{API_ROOT}/search/issues", params={"q": q}):
-        pr = {"number": item["number"], "title": item.get("title", ""), "url": item.get("html_url")}
+    for item in gh_paginate(session, f"{api_root or API_ROOT}/search/issues", params={"q": q}):
+        pr = {"number": item["number"], "title": item.get("title", "")}
+        # Carried when the search item has it, for deploy_source "merge"; a
+        # PR without it gets its merge time from get_pr_merged_at there.
         merged = (item.get("pull_request") or {}).get("merged_at")
         if merged:
             pr["merged_at"] = parse_ts(merged)
@@ -761,125 +457,753 @@ def get_merged_prs_between(session: requests.Session, repo: str, branch: str, st
     return prs
 
 
+def get_pr_merged_at(session: requests.Session, repo: str, pr_number: int, api_root: str = None):
+    """merged_at of one PR, from the PR object (deploy_source "merge"). None
+    when the PR can't be read or carries no merge time."""
+    resp = session.get(f"{api_root or API_ROOT}/repos/{repo}/pulls/{pr_number}")
+    if not resp.ok:
+        return None
+    data = resp.json()
+    merged = data.get("merged_at") if isinstance(data, dict) else None
+    return parse_ts(merged) if merged else None
+
+
+def get_release_tag_names(session: requests.Session, repo: str, api_root: str = None) -> dict:
+    """Tag names of every Release in the repo, split by draft state. Used only
+    to explain an empty result — the measurement itself goes through
+    get_prod_releases."""
+    published, draft = [], []
+    for r in gh_paginate(session, f"{api_root or API_ROOT}/repos/{repo}/releases"):
+        name = r.get("tag_name", "")
+        if not name:
+            continue
+        (draft if r.get("draft") else published).append(name)
+    return {"published": published, "draft": draft}
+
+
+def get_all_tag_names(session: requests.Session, repo: str, api_root: str = None) -> list:
+    """Every git tag name in the repo, unfiltered."""
+    return [t.get("name", "") for t in gh_paginate(session, f"{api_root or API_ROOT}/repos/{repo}/tags")
+            if t.get("name")]
+
+
+# --- GitLab (REST v4) --------------------------------------------------------
+# https://docs.gitlab.com/api/rest/ — offset pagination with `page`/`per_page`
+# (max 100) and a Link header carrying rel="next", which the docs recommend
+# following instead of building page URLs by hand.
+
+def gitlab_project_id(path: str) -> str:
+    """A project path used as the `:id` of a GitLab URL must be URL-encoded
+    (`group/sub/project` -> `group%2Fsub%2Fproject`); unencoded, the API
+    answers 404."""
+    return quote(path, safe="")
+
+
+def _gitlab_project_url(repo: str, api_root: str = None) -> str:
+    return f"{api_root or GITLAB_API_ROOT}/projects/{gitlab_project_id(repo)}"
+
+
+def gitlab_paginate(session: requests.Session, url: str, params: dict = None):
+    """GET with pagination via the Link header. Yields items from each page.
+    Raises GitLabError with the same message prefixes gh_paginate uses, so
+    classify_api_error reads all providers alike."""
+    params = dict(params or {})
+    params.setdefault("per_page", 100)
+    next_url = url
+    next_params = params
+    while next_url:
+        resp = session.get(next_url, params=next_params)
+        if resp.status_code == 401:
+            raise GitLabError(
+                "401 Unauthorized. Check that GITLAB_TOKEN (or `glab auth token`) is valid and has "
+                "read access to ALL the groups of the project's GitLab repos.",
+                status=401,
+            )
+        if resp.status_code == 429:
+            raise GitLabError(f"Rate limit reached: {resp.text[:300]}", status=429)
+        if resp.status_code == 404:
+            raise GitLabError(f"404 Not Found at {next_url} — does the project exist and does the token have access?",
+                              status=404)
+        if not resp.ok:
+            raise GitLabError(f"GitLab API error {resp.status_code} at {next_url}: {resp.text[:300]}",
+                              status=resp.status_code)
+        for item in resp.json():
+            yield item
+        next_url = None
+        next_params = None
+        if "next" in resp.links:
+            next_url = resp.links["next"]["url"]
+
+
+def get_gitlab_tags(session: requests.Session, repo: str, tag_pattern: str, api_root: str = None):
+    """Tags whose name matches tag_pattern, ascending order. Filtered here
+    because the API's `search` parameter is a prefix/suffix match, not a regex.
+
+    Dated by the tag's own `created_at` ("Date when the tag was created") when
+    the API gives one, otherwise by the commit it points to
+    (`commit.committed_date`) — the same tagging-date/commit-date split
+    get_prod_tags makes for GitHub's annotated and lightweight tags."""
+    pattern = re.compile(tag_pattern)
+    tags = []
+    for t in gitlab_paginate(session, f"{_gitlab_project_url(repo, api_root)}/repository/tags"):
+        name = t.get("name", "")
+        if not pattern.match(name):
+            continue
+        commit = t.get("commit") or {}
+        date_str = t.get("created_at") or commit.get("committed_date") or commit.get("created_at")
+        if not date_str:
+            continue
+        tags.append({"tag": name, "published_at": parse_iso_ts(date_str), "url": None})
+    tags.sort(key=lambda x: x["published_at"])
+    return tags
+
+
+def _gitlab_release_ts(release: dict):
+    released = release.get("released_at") or release.get("created_at")
+    return parse_iso_ts(released) if released else None
+
+
+def get_gitlab_releases(session: requests.Session, repo: str, tag_pattern: str, now: datetime = None,
+                        api_root: str = None):
+    """Releases whose tag matches tag_pattern, ascending order by `released_at`.
+    An upcoming release (`released_at` still in the future) is GitLab's
+    equivalent of a GitHub draft — it hasn't happened yet — so it is left out.
+    Detected by comparing against `now`, not by the `upcoming_release` key,
+    whose presence on past releases the docs don't pin down."""
+    now = now or datetime.now(timezone.utc)
+    pattern = re.compile(tag_pattern)
+    releases = []
+    for r in gitlab_paginate(session, f"{_gitlab_project_url(repo, api_root)}/releases"):
+        tag = r.get("tag_name", "")
+        if not pattern.match(tag):
+            continue
+        released_at = _gitlab_release_ts(r)
+        if released_at is None or released_at > now:
+            continue
+        releases.append({"tag": tag, "published_at": released_at, "url": (r.get("_links") or {}).get("self")})
+    releases.sort(key=lambda x: x["published_at"])
+    return releases
+
+
+def get_gitlab_release_tag_names(session: requests.Session, repo: str, now: datetime = None,
+                                 api_root: str = None) -> dict:
+    """Tag names of every Release in the project, with the upcoming ones under
+    "draft" (same shape as get_release_tag_names). Used only to explain an
+    empty result."""
+    now = now or datetime.now(timezone.utc)
+    published, draft = [], []
+    for r in gitlab_paginate(session, f"{_gitlab_project_url(repo, api_root)}/releases"):
+        name = r.get("tag_name", "")
+        if not name:
+            continue
+        released_at = _gitlab_release_ts(r)
+        (draft if released_at is not None and released_at > now else published).append(name)
+    return {"published": published, "draft": draft}
+
+
+def get_gitlab_all_tag_names(session: requests.Session, repo: str, api_root: str = None) -> list:
+    """Every git tag name in the project, unfiltered."""
+    return [t.get("name", "")
+            for t in gitlab_paginate(session, f"{_gitlab_project_url(repo, api_root)}/repository/tags")
+            if t.get("name")]
+
+
+def get_gitlab_merged_mrs_between(session: requests.Session, repo: str, branch: str, start: datetime,
+                                  end: datetime, api_root: str = None):
+    """MRs merged into `branch` between start and end, filtered server-side
+    with `merged_after`/`merged_before`. The MR's project-scoped `iid` is the
+    number the rest of the script calls `number`.
+
+    The window is checked again on each MR's own `merged_at`: the docs give no
+    version history for those two parameters, and a self-hosted instance
+    (`api_base`) that ignored them would otherwise hand back every merged MR
+    on the branch and inflate the Lead Time silently."""
+    params = {
+        "state": "merged",
+        "target_branch": branch,
+        "merged_after": fmt_ts(start),
+        "merged_before": fmt_ts(end),
+    }
+    mrs = []
+    for item in gitlab_paginate(session, f"{_gitlab_project_url(repo, api_root)}/merge_requests", params=params):
+        merged_at = item.get("merged_at")
+        mr = {"number": item["iid"], "title": item.get("title", "")}
+        if merged_at:
+            mr["merged_at"] = parse_iso_ts(merged_at)
+            if not (start <= mr["merged_at"] <= end):
+                continue
+        mrs.append(mr)
+    return mrs
+
+
+def get_gitlab_mr_first_commit_ts(session: requests.Session, repo: str, mr_iid: int, api_root: str = None):
+    """Timestamp of the MR's first commit, read from the MR's own commit list
+    (stays correct after a squash). The list's order isn't documented, so the
+    earliest date wins rather than the first or last item.
+
+    A 403/404 on this one MR's commit list returns None, so only this MR is
+    excluded (pr_first_commit_unfetchable) instead of the whole repo. A 401 or
+    a rate limit still raises: those affect every request."""
+    url = f"{_gitlab_project_url(repo, api_root)}/merge_requests/{mr_iid}/commits"
+    dates = []
+    try:
+        for c in gitlab_paginate(session, url):
+            d = c.get("authored_date") or c.get("committed_date") or c.get("created_at")
+            if d:
+                dates.append(parse_iso_ts(d))
+    except GitLabError as e:
+        if e.status in _PER_CHANGE_MISSING_STATUSES:
+            return None
+        raise
+    return min(dates) if dates else None
+
+
+# --- Bitbucket Cloud (REST 2.0) ---------------------------------------------
+# https://developer.atlassian.com/cloud/bitbucket/rest/intro/ — every list is
+# a page object `{values, next, ...}`; `next` is followed as given, never
+# rebuilt. No Releases API: deploy markers are always plain tags.
+
+def _bitbucket_check(resp, url: str) -> None:
+    """Raises BitbucketError with the same message prefixes gh_paginate uses.
+    Bitbucket's docs don't document a 429 response; it is still read as a rate
+    limit, without relying on a Retry-After header."""
+    if resp.status_code == 401:
+        raise BitbucketError(
+            "401 Unauthorized. Check that BITBUCKET_TOKEN (or BITBUCKET_USERNAME + "
+            "BITBUCKET_APP_PASSWORD) is valid and has read access to ALL the workspaces of the "
+            "project's Bitbucket repos.",
+            status=401,
+        )
+    if resp.status_code == 429:
+        raise BitbucketError(f"Rate limit reached: {resp.text[:300]}", status=429)
+    if resp.status_code == 404:
+        raise BitbucketError(f"404 Not Found at {url} — does the repo exist and does the credential have access?",
+                             status=404)
+    if not resp.ok:
+        raise BitbucketError(f"Bitbucket API error {resp.status_code} at {url}: {resp.text[:300]}",
+                             status=resp.status_code)
+
+
+def bitbucket_paginate(session: requests.Session, url: str, params: dict = None):
+    """GET following each page's `next` URL. Yields items from `values`.
+    Asks for 50 items a page on the first request (`next` carries it on): the
+    REST intro says "Globally, the minimum length is 10 and the maximum is
+    100", and the default (10 in its example) would multiply the requests of a
+    full merged-PR scan."""
+    next_url = url
+    next_params = dict(params or {})
+    next_params.setdefault("pagelen", 50)
+    while next_url:
+        resp = session.get(next_url, params=next_params)
+        _bitbucket_check(resp, next_url)
+        data = resp.json()
+        for item in data.get("values", []):
+            yield item
+        # `next` already carries every query parameter of the first request.
+        next_url = data.get("next")
+        next_params = None
+
+
+def _bitbucket_repo_url(repo: str, api_root: str = None) -> str:
+    return f"{api_root or BITBUCKET_API_ROOT}/repositories/{repo}"
+
+
+def get_bitbucket_tags(session: requests.Session, repo: str, tag_pattern: str, api_root: str = None):
+    """Tags whose name matches tag_pattern, ascending order. Dated by the tag's
+    own `date` (present on annotated tags), otherwise by its target commit's
+    `date` — the closest Bitbucket gets to GitHub's tagger-date/commit-date
+    split."""
+    pattern = re.compile(tag_pattern)
+    tags = []
+    for t in bitbucket_paginate(session, f"{_bitbucket_repo_url(repo, api_root)}/refs/tags"):
+        name = t.get("name", "")
+        if not pattern.match(name):
+            continue
+        date_str = t.get("date") or (t.get("target") or {}).get("date")
+        if not date_str:
+            continue
+        tags.append({"tag": name, "published_at": parse_iso_ts(date_str), "url": None})
+    tags.sort(key=lambda x: x["published_at"])
+    return tags
+
+
+def get_bitbucket_all_tag_names(session: requests.Session, repo: str, api_root: str = None) -> list:
+    """Every git tag name in the repo, unfiltered."""
+    return [t.get("name", "")
+            for t in bitbucket_paginate(session, f"{_bitbucket_repo_url(repo, api_root)}/refs/tags")
+            if t.get("name")]
+
+
+def _bitbucket_pr_merged_at(session: requests.Session, repo: str, pr_item: dict, api_root: str):
+    """When the PR was merged. The PR object has no "merged at" field, so the
+    merge commit's own date stands in for it; when that commit can't be read,
+    the PR's `updated_on` is the fallback (a merged PR's last update is, at
+    the latest, its merge)."""
+    commit_hash = (pr_item.get("merge_commit") or {}).get("hash")
+    if commit_hash:
+        url = f"{_bitbucket_repo_url(repo, api_root)}/commit/{commit_hash}"
+        resp = session.get(url)
+        if resp.status_code in (401, 429):
+            _bitbucket_check(resp, url)
+        if resp.ok:
+            date_str = (resp.json() or {}).get("date")
+            if date_str:
+                return parse_iso_ts(date_str)
+    updated_on = pr_item.get("updated_on")
+    return parse_iso_ts(updated_on) if updated_on else None
+
+
+def _bitbucket_merged_prs_since(session: requests.Session, repo: str, branch: str, since: datetime,
+                                api_root: str = None) -> list:
+    """Every PR merged into `branch` that can have been merged at or after
+    `since`, with its merge time resolved. Only `state=MERGED` is pushed to the
+    API; the destination branch is checked here.
+
+    A PR last updated before `since` can't have been merged after it, so its
+    merge commit is never fetched — that keeps the per-PR call to the PRs that
+    can still matter."""
+    prs = []
+    for item in bitbucket_paginate(session, f"{_bitbucket_repo_url(repo, api_root)}/pullrequests",
+                                   params={"state": "MERGED"}):
+        destination = ((item.get("destination") or {}).get("branch") or {}).get("name")
+        if destination is not None and destination != branch:
+            continue
+        updated_on = item.get("updated_on")
+        if updated_on and parse_iso_ts(updated_on) < since:
+            continue
+        merged_at = _bitbucket_pr_merged_at(session, repo, item, api_root)
+        if merged_at is None:
+            continue
+        prs.append({"number": item["id"], "title": item.get("title", ""), "merged_at": merged_at})
+    return prs
+
+
+def get_bitbucket_merged_prs_between(session: requests.Session, repo: str, branch: str, start: datetime,
+                                     end: datetime, api_root: str = None, cache: dict = None):
+    """PRs merged into `branch` between start and end (both inclusive, like
+    GitHub's `merged:start..end`).
+
+    Bitbucket can't filter merged PRs by branch or date on the server (not
+    with documented fields), so each call scans the repo's whole merged-PR
+    list. `cache` lets the deploy intervals of one measurement share a single
+    scan: it keeps, per repo and branch, the PRs that can have been merged
+    since the earliest start seen so far, and a later call whose start is not
+    earlier reuses them instead of scanning again. compute_repo_metrics walks
+    the intervals oldest first, so one repo costs one scan and one merge-commit
+    lookup per recent PR, however many deploys it had."""
+    key = (repo, branch)
+    cached = cache.get(key) if cache is not None else None
+    if cached is not None and cached["since"] <= start:
+        candidates = cached["prs"]
+    else:
+        candidates = _bitbucket_merged_prs_since(session, repo, branch, start, api_root)
+        if cache is not None:
+            cache[key] = {"since": start, "prs": candidates}
+    return [{"number": pr["number"], "title": pr["title"], "merged_at": pr["merged_at"]}
+            for pr in candidates if start <= pr["merged_at"] <= end]
+
+
+def get_bitbucket_pr_first_commit_ts(session: requests.Session, repo: str, pr_id: int, api_root: str = None):
+    """Timestamp of the PR's first commit, read from the PR's own commit list.
+    The docs call the list "chronological" without saying which way, so the
+    earliest date wins.
+
+    Documented cases where a merged PR has no commits to read
+    (https://api.bitbucket.org/swagger.json, GET
+    /repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}/commits):
+    - 200 with a list that "will be empty if the source branch no longer
+      exists", which is common when PRs close their source branch on merge;
+    - 404 "if the pull request does not exist or the source branch is from a
+      forked repository which no longer exists";
+    - 403 "if the authenticated user does not have access to the pull request".
+    All three return None, so only this PR is excluded
+    (pr_first_commit_unfetchable) and the repo is still measured. A 401 or a
+    rate limit still raises: those affect every request."""
+    url = f"{_bitbucket_repo_url(repo, api_root)}/pullrequests/{pr_id}/commits"
+    try:
+        dates = [parse_iso_ts(c["date"]) for c in bitbucket_paginate(session, url) if c.get("date")]
+    except BitbucketError as e:
+        if e.status in _PER_CHANGE_MISSING_STATUSES:
+            return None
+        raise
+    return min(dates) if dates else None
+
+
+# --- Azure DevOps (Git REST 7.1) --------------------------------------------
+# https://learn.microsoft.com/rest/api/azure/devops/git/ — every list is
+# `{value, count}`, continued through the `x-ms-continuationtoken` response
+# header (refs) or `$top`/`$skip` (pull requests). No Releases API in Git:
+# deploy markers are tags or merges. Repos are `organization/project/repository`.
+
+def _json(resp):
+    """Azure DevOps answers with a UTF-8 BOM on some endpoints, which
+    `resp.json()` chokes on. Strips it before decoding."""
+    text = resp.text if isinstance(getattr(resp, "text", None), str) else ""
+    if text and text.lstrip().startswith("﻿"):
+        return json.loads(text.lstrip().lstrip("﻿"))
+    return resp.json()
+
+
+def _azure_check(resp, url: str) -> None:
+    """Raises AzureDevOpsError with the same message prefixes gh_paginate
+    uses. A bad or expired PAT gets a 203 with the HTML sign-in page instead
+    of a 401, so a 203 is read as a 401."""
+    if resp.status_code in (401, 203):
+        raise AzureDevOpsError(
+            "401 Unauthorized. Check that AZURE_DEVOPS_PAT (or the `az login` token) is valid and has "
+            "Code (Read) access to ALL the projects of the project's Azure DevOps repos.",
+            status=401,
+        )
+    if resp.status_code == 429:
+        raise AzureDevOpsError(f"Rate limit reached: {(resp.text or '')[:300]}", status=429)
+    if resp.status_code == 404:
+        raise AzureDevOpsError(f"404 Not Found at {url} — does the repo exist and does the credential have access?",
+                               status=404)
+    if not resp.ok:
+        raise AzureDevOpsError(f"Azure DevOps API error {resp.status_code} at {url}: {(resp.text or '')[:300]}",
+                               status=resp.status_code)
+
+
+def azure_paginate(session: requests.Session, url: str, params: dict = None):
+    """GET following Azure DevOps pagination. Yields items from `value`.
+    Continues through the `x-ms-continuationtoken` header when the response
+    carries one, otherwise through `$skip` when the request set `$top` and the
+    page came back full."""
+    params = dict(params or {})
+    params.setdefault("api-version", AZURE_API_VERSION)
+    use_skip = "$top" in params
+    skip = int(params.get("$skip", 0))
+    while True:
+        if use_skip:
+            params["$skip"] = skip
+        resp = session.get(url, params=params)
+        _azure_check(resp, url)
+        data = _json(resp)
+        items = data.get("value", []) if isinstance(data, dict) else data
+        for item in items:
+            yield item
+        token = (getattr(resp, "headers", None) or {}).get("x-ms-continuationtoken")
+        if token:
+            params["continuationToken"] = token
+            continue
+        if use_skip and len(items) >= int(params["$top"]):
+            skip += len(items)
+            continue
+        return
+
+
+def azure_repo_parts(repo: str):
+    """`organization/project/repository` -> (org, project, repository). The
+    project and repository names may hold spaces or dots; they are URL-quoted
+    where they appear in a path."""
+    parts = repo.split("/")
+    if len(parts) != 3 or not all(parts):
+        raise ValueError(f"Azure DevOps repos are identified as organization/project/repository, got {repo!r}.")
+    return parts[0], parts[1], parts[2]
+
+
+def _azure_repo_url(repo: str, api_root: str = None) -> str:
+    org, project, name = azure_repo_parts(repo)
+    root = api_root or AZURE_API_ROOT
+    return f"{root}/{quote(org, safe='')}/{quote(project, safe='')}/_apis/git/repositories/{quote(name, safe='')}"
+
+
+def _azure_tag_name(ref: dict) -> str:
+    return (ref.get("name") or "").replace("refs/tags/", "", 1)
+
+
+def get_azure_tags(session: requests.Session, repo: str, tag_pattern: str, api_root: str = None):
+    """Tags whose name matches tag_pattern, ascending order. An annotated tag
+    (the ref has a `peeledObjectId`) is dated by its tag object's `taggedBy`
+    date, a lightweight one by the commit it points to — the same
+    tagging-date/commit-date split get_prod_tags makes for GitHub."""
+    base = _azure_repo_url(repo, api_root)
+    pattern = re.compile(tag_pattern)
+    tags = []
+    for ref in azure_paginate(session, f"{base}/refs", params={"filter": "tags/"}):
+        name = _azure_tag_name(ref)
+        if not pattern.match(name):
+            continue
+        date_str, url = None, None
+        if ref.get("peeledObjectId"):
+            resp = session.get(f"{base}/annotatedtags/{ref['objectId']}", params={"api-version": AZURE_API_VERSION})
+            if resp.ok:
+                data = _json(resp)
+                if isinstance(data, dict):
+                    date_str = (data.get("taggedBy") or {}).get("date")
+                    url = data.get("url")
+            commit_id = ref["peeledObjectId"]
+        else:
+            commit_id = ref.get("objectId")
+        if not date_str and commit_id:
+            resp = session.get(f"{base}/commits/{commit_id}", params={"api-version": AZURE_API_VERSION})
+            if resp.ok:
+                data = _json(resp)
+                if isinstance(data, dict):
+                    date_str = (data.get("committer") or {}).get("date") or (data.get("author") or {}).get("date")
+                    url = url or data.get("remoteUrl")
+        if not date_str:
+            continue
+        tags.append({"tag": name, "published_at": parse_iso_ts(date_str), "url": url})
+    tags.sort(key=lambda x: x["published_at"])
+    return tags
+
+
+def get_azure_all_tag_names(session: requests.Session, repo: str, api_root: str = None) -> list:
+    """Every git tag name in the repo, unfiltered."""
+    base = _azure_repo_url(repo, api_root)
+    return [_azure_tag_name(ref)
+            for ref in azure_paginate(session, f"{base}/refs", params={"filter": "tags/"}) if ref.get("name")]
+
+
+def get_azure_pr_first_commit_ts(session: requests.Session, repo: str, pr_id: int, api_root: str = None):
+    """Timestamp of the PR's first commit, read from the PR's own commit list
+    (stays correct after a squash); the earliest date wins.
+
+    A 403/404 on this one PR's commit list returns None, so only this PR is
+    excluded (pr_first_commit_unfetchable) instead of the whole repo. A 401 or
+    a rate limit still raises: those affect every request."""
+    base = _azure_repo_url(repo, api_root)
+    dates = []
+    try:
+        for c in azure_paginate(session, f"{base}/pullrequests/{pr_id}/commits"):
+            d = (c.get("author") or {}).get("date") or (c.get("committer") or {}).get("date")
+            if d:
+                dates.append(parse_iso_ts(d))
+    except AzureDevOpsError as e:
+        if e.status in _PER_CHANGE_MISSING_STATUSES:
+            return None
+        raise
+    return min(dates) if dates else None
+
+
+def get_azure_merged_prs_between(session: requests.Session, repo: str, branch: str, start: datetime,
+                                 end: datetime, api_root: str = None):
+    """Completed PRs into `branch` whose `closedDate` (= the merge) is between
+    start and end (both inclusive, like GitHub's `merged:start..end`). The API
+    returns them newest first and pages only with `$top`/`$skip`, so the scan
+    stops at the first PR closed before `start`."""
+    base = _azure_repo_url(repo, api_root)
+    params = {"searchCriteria.status": "completed", "searchCriteria.targetRefName": f"refs/heads/{branch}",
+              "$top": 100}
+    prs = []
+    for item in azure_paginate(session, f"{base}/pullrequests", params=params):
+        closed = item.get("closedDate")
+        if not closed:
+            continue
+        merged_at = parse_iso_ts(closed)
+        if merged_at < start:
+            break  # newest first: everything after this is older than the window
+        if merged_at > end:
+            continue
+        prs.append({"number": item["pullRequestId"], "title": item.get("title", ""), "merged_at": merged_at})
+    return prs
+
+
+# --- Provider dispatch -------------------------------------------------------
+
 def _is_rate_limited(resp) -> bool:
     return resp.status_code == 403 and "rate limit" in (resp.text or "").lower()
 
 
-def preflight_repo(session: requests.Session, repo: str, branch: str, provider: str = "github",
+def _is_429(resp) -> bool:
+    return resp.status_code == 429
+
+
+def _is_401(resp) -> bool:
+    return resp.status_code == 401
+
+
+def _is_404(resp) -> bool:
+    return resp.status_code == 404
+
+
+def _azure_unauthorized(resp) -> bool:
+    """A bad PAT gets a 203 with the HTML sign-in page instead of a 401."""
+    return resp.status_code in (401, 203)
+
+
+def _azure_branch_missing(resp) -> bool:
+    """The branch lookup is a refs listing filtered by name: a missing branch
+    is a 200 with an empty `value`, not a 404."""
+    if resp.status_code == 404:
+        return True
+    if resp.status_code != 200:
+        return False
+    try:
+        data = _json(resp)
+    except ValueError:
+        return False
+    return isinstance(data, dict) and not data.get("value")
+
+
+# Each builder returns one provider's operations. Everything else asks
+# `_provider_api` for "release", "tag", "merged", "first_commit",
+# "release_names", "tag_names", "preflight_urls", "rate_limited",
+# "unauthorized", "branch_missing" or "merged_at", and never branches on the
+# provider itself. A provider with no Releases API has no "release" /
+# "release_names" entries.
+#
+# The metric entries are lambdas so the module-level function is looked up at
+# call time (the tests patch them). `kw` carries `api_root` only when the repo
+# sets `api_base`, so a GitHub run without it makes exactly the calls it always
+# made. `root` is the API root actually in use, for the preflight URLs.
+#
+# "preflight_urls" gives the repo URL and the production-branch URL; branch
+# names are URL-encoded for GitLab and Bitbucket, whose branch endpoints take
+# the name as one path segment, while GitHub keeps the request it always made.
+# "rate_limited" reads a response: GitHub signals its rate limit as a 403 with
+# "rate limit" in the body, GitLab, Bitbucket and Azure DevOps as a plain 429.
+# "unauthorized" and "branch_missing" read the preflight responses: a 401 and
+# a 404 everywhere but Azure DevOps (see _azure_unauthorized and
+# _azure_branch_missing).
+# "merged_at" resolves one PR's merge time for deploy_source "merge" when the
+# merged listing didn't carry it; only GitHub (whose Search items may lack it)
+# has one, the other listings always carry the merge time.
+
+def _github_api(kw: dict, root: str, now: datetime) -> dict:
+    return {
+        "release": lambda s, r, p: get_prod_releases(s, r, p, **kw),
+        "tag": lambda s, r, p: get_prod_tags(s, r, p, **kw),
+        "merged": lambda s, r, b, a, z: get_merged_prs_between(s, r, b, a, z, **kw),
+        "first_commit": lambda s, r, n: get_pr_first_commit_ts(s, r, n, **kw),
+        "release_names": lambda s, r: get_release_tag_names(s, r, **kw),
+        "tag_names": lambda s, r: get_all_tag_names(s, r, **kw),
+        "merged_at": lambda s, r, n: get_pr_merged_at(s, r, n, **kw),
+        "preflight_urls": lambda r, b: (f"{root}/repos/{r}", f"{root}/repos/{r}/branches/{b}"),
+        "rate_limited": _is_rate_limited,
+        "unauthorized": _is_401,
+        "branch_missing": _is_404,
+    }
+
+
+def _gitlab_api(kw: dict, root: str, now: datetime) -> dict:
+    def preflight_urls(repo, branch):
+        project = f"{root}/projects/{gitlab_project_id(repo)}"
+        return project, f"{project}/repository/branches/{quote(branch, safe='')}"
+
+    return {
+        "release": lambda s, r, p: get_gitlab_releases(s, r, p, now=now, **kw),
+        "tag": lambda s, r, p: get_gitlab_tags(s, r, p, **kw),
+        "merged": lambda s, r, b, a, z: get_gitlab_merged_mrs_between(s, r, b, a, z, **kw),
+        "first_commit": lambda s, r, n: get_gitlab_mr_first_commit_ts(s, r, n, **kw),
+        "release_names": lambda s, r: get_gitlab_release_tag_names(s, r, now=now, **kw),
+        "tag_names": lambda s, r: get_gitlab_all_tag_names(s, r, **kw),
+        "preflight_urls": preflight_urls,
+        "rate_limited": _is_429,
+        "unauthorized": _is_401,
+        "branch_missing": _is_404,
+    }
+
+
+def _bitbucket_api(kw: dict, root: str, now: datetime) -> dict:
+    def preflight_urls(repo, branch):
+        repository = f"{root}/repositories/{repo}"
+        return repository, f"{repository}/refs/branches/{quote(branch, safe='')}"
+
+    # One merged-PR scan per repo and branch, shared by every deploy interval
+    # of this measurement (see get_bitbucket_merged_prs_between).
+    merged_cache = {}
+    return {
+        "tag": lambda s, r, p: get_bitbucket_tags(s, r, p, **kw),
+        "merged": lambda s, r, b, a, z: get_bitbucket_merged_prs_between(s, r, b, a, z, cache=merged_cache, **kw),
+        "first_commit": lambda s, r, n: get_bitbucket_pr_first_commit_ts(s, r, n, **kw),
+        "tag_names": lambda s, r: get_bitbucket_all_tag_names(s, r, **kw),
+        "preflight_urls": preflight_urls,
+        "rate_limited": _is_429,
+        "unauthorized": _is_401,
+        "branch_missing": _is_404,
+    }
+
+
+def _azure_api(kw: dict, root: str, now: datetime) -> dict:
+    def preflight_urls(repo, branch):
+        repository = _azure_repo_url(repo, root)
+        return repository, f"{repository}/refs?filter=heads/{quote(branch, safe='/')}"
+
+    return {
+        "tag": lambda s, r, p: get_azure_tags(s, r, p, **kw),
+        "merged": lambda s, r, b, a, z: get_azure_merged_prs_between(s, r, b, a, z, **kw),
+        "first_commit": lambda s, r, n: get_azure_pr_first_commit_ts(s, r, n, **kw),
+        "tag_names": lambda s, r: get_azure_all_tag_names(s, r, **kw),
+        "preflight_urls": preflight_urls,
+        "rate_limited": _is_429,
+        "unauthorized": _azure_unauthorized,
+        "branch_missing": _azure_branch_missing,
+    }
+
+
+_PROVIDER_APIS = {
+    "github": _github_api,
+    "gitlab": _gitlab_api,
+    "bitbucket": _bitbucket_api,
+    "azure": _azure_api,
+}
+
+
+def _provider_api(provider: str, api_root: str = None, now: datetime = None) -> dict:
+    """The one place that picks a provider's operations (see the builders
+    above). Adding a provider means one PROVIDERS entry and one builder."""
+    kw = {} if api_root is None else {"api_root": api_root}
+    root = api_root or PROVIDERS[provider]["api_root"]
+    return _PROVIDER_APIS[provider](kw, root, now)
+
+
+def preflight_repo(session: requests.Session, repo: str, branch: str, provider: str = DEFAULT_PROVIDER,
                    api_root: str = None) -> list:
     """Checks, before measuring, the two things whose absence would otherwise
     produce a silent or misleading result: that the credential can see the repo
     at all, and that the configured production branch exists. Two cheap REST
-    calls per repo (not Search, which is the rate-limited API).
+    calls per repo (not Search, which is GitHub's rate-limited API).
 
     A returned issue with impact "blocked" means the repo cannot be measured;
-    the caller skips it and keeps going with the rest of the project."""
-    if provider == "github":
-        return _preflight_github(session, repo, branch, api_root or API_ROOT)
+    the caller skips it and keeps going with the rest of the project. A 404 on
+    the repo means "not found or not visible to this credential" on every
+    provider, so it is reported as unreachable, never as missing."""
+    issues = []
     label = provider_label(provider)
-    if provider == "gitlab":
-        root = api_root or GITLAB_API_ROOT
-        repo_url = f"{root}/projects/{gitlab_project_id(repo)}"
-        branch_url = f"{repo_url}/repository/branches/{branch}"
-    elif provider == "bitbucket":
-        root = api_root or BITBUCKET_API_ROOT
-        repo_url = f"{root}/repositories/{repo}"
-        branch_url = f"{repo_url}/refs/branches/{branch}"
-    else:  # azure
-        repo_url = _azure_repo_url(repo, api_root)
-        branch_url = f"{repo_url}/refs?filter=heads/{branch}"
+    root = api_root or PROVIDERS[provider]["api_root"]
+    api = _provider_api(provider, api_root)
+    repo_url, branch_url = api["preflight_urls"](repo, branch)
+    rate_limited = api["rate_limited"]
 
     resp = session.get(repo_url)
-    status = resp.status_code
-    if status == 401 or (provider == "azure" and status == 203):
+    if api["unauthorized"](resp):
         return [make_issue("token_unauthorized", "blocked",
                            f"{repo}: 401 Unauthorized from the {label} API — the credential is not valid for this repo.")]
-    if status == 429 or _is_rate_limited(resp):
+    if rate_limited(resp):
         return [make_issue("rate_limited", "blocked",
                            f"{repo}: {label} API rate limit reached — it could not be measured in this run.")]
-    if status in (403, 404):
+    if resp.status_code in (403, 404):
         return [make_issue("repo_unreachable", "blocked",
-                           f"{repo}: the {label} API returned {status} — the repo is unreachable with this "
+                           f"{repo}: the {label} API returned {resp.status_code} — the repo is unreachable with this "
                            "credential, it could not be measured.",
-                           evidence={"status": status})]
-    if status != 200:
+                           evidence={"status": resp.status_code})]
+    if resp.status_code != 200:
         return [make_issue("api_error", "blocked",
-                           f"{repo}: {label} API error {status} on {repo_url}: {(resp.text or '')[:300]}",
-                           evidence={"status": status})]
+                           f"{repo}: {label} API error {resp.status_code} on {repo_url[len(root):]}: "
+                           f"{(resp.text or '')[:300]}",
+                           evidence={"status": resp.status_code})]
 
-    issues = []
     branch_resp = session.get(branch_url)
-    bstatus = branch_resp.status_code
-    missing = bstatus == 404
-    if provider == "azure" and bstatus == 200:
-        try:
-            data = _json(branch_resp)
-            missing = isinstance(data, dict) and not data.get("value")
-        except Exception:
-            missing = False
-    if missing:
+    if api["branch_missing"](branch_resp):
         issues.append(make_issue(
             "branch_not_found", "partial",
             f"{repo}: branch '{branch}' does not exist — Lead Time can't be measured against it "
             "(Deployment Frequency is unaffected).",
             evidence={"prod_branch": branch},
         ))
-    elif bstatus == 429 or _is_rate_limited(branch_resp):
+    elif rate_limited(branch_resp):
         issues.append(make_issue(
             "rate_limited", "partial",
             f"{repo}: {label} API rate limit reached while checking branch '{branch}' — its existence "
             "could not be verified.",
             evidence={"prod_branch": branch},
         ))
-    elif bstatus != 200:
-        issues.append(make_issue(
-            "api_error", "partial",
-            f"{repo}: {label} API error {bstatus} checking branch '{branch}' — its "
-            f"existence could not be verified: {(branch_resp.text or '')[:300]}",
-            evidence={"status": bstatus, "prod_branch": branch},
-        ))
-    return issues
-
-
-def _preflight_github(session: requests.Session, repo: str, branch: str, api_root: str) -> list:
-    issues = []
-
-    resp = session.get(f"{api_root}/repos/{repo}")
-    if resp.status_code == 401:
-        return [make_issue("token_unauthorized", "blocked",
-                           f"{repo}: 401 Unauthorized from the GitHub API — the credential is not valid for this repo.")]
-    if _is_rate_limited(resp):
-        return [make_issue("rate_limited", "blocked",
-                           f"{repo}: GitHub API rate limit reached — it could not be measured in this run.")]
-    if resp.status_code in (403, 404):
-        return [make_issue("repo_unreachable", "blocked",
-                           f"{repo}: the GitHub API returned {resp.status_code} — the repo is unreachable with this "
-                           "credential, it could not be measured.",
-                           evidence={"status": resp.status_code})]
-    if resp.status_code != 200:
-        return [make_issue("api_error", "blocked",
-                           f"{repo}: GitHub API error {resp.status_code} on /repos/{repo}: {(resp.text or '')[:300]}",
-                           evidence={"status": resp.status_code})]
-
-    branch_resp = session.get(f"{api_root}/repos/{repo}/branches/{branch}")
-    if branch_resp.status_code == 404:
-        issues.append(make_issue(
-            "branch_not_found", "partial",
-            f"{repo}: branch '{branch}' does not exist — Lead Time can't be measured against it "
-            "(Deployment Frequency is unaffected).",
-            evidence={"prod_branch": branch},
-        ))
-    elif _is_rate_limited(branch_resp):
-        issues.append(make_issue(
-            "rate_limited", "partial",
-            f"{repo}: GitHub API rate limit reached while checking branch '{branch}' — its existence "
-            "could not be verified.",
-            evidence={"prod_branch": branch},
-        ))
     elif branch_resp.status_code != 200:
         issues.append(make_issue(
             "api_error", "partial",
-            f"{repo}: GitHub API error {branch_resp.status_code} checking branch '{branch}' — its "
+            f"{repo}: {label} API error {branch_resp.status_code} checking branch '{branch}' — its "
             f"existence could not be verified: {(branch_resp.text or '')[:300]}",
             evidence={"status": branch_resp.status_code, "prod_branch": branch},
         ))
@@ -889,40 +1213,26 @@ def _preflight_github(session: requests.Session, repo: str, branch: str, api_roo
 EVIDENCE_SAMPLE_SIZE = 5
 
 
-def get_release_tag_names(session: requests.Session, repo: str) -> dict:
-    """Tag names of every Release in the repo, split by draft state. Used only
-    to explain an empty result — the measurement itself goes through
-    get_prod_releases."""
-    published, draft = [], []
-    for r in gh_paginate(session, f"{API_ROOT}/repos/{repo}/releases"):
-        name = r.get("tag_name", "")
-        if not name:
-            continue
-        (draft if r.get("draft") else published).append(name)
-    return {"published": published, "draft": draft}
-
-
-def get_all_tag_names(session: requests.Session, repo: str) -> list:
-    """Every git tag name in the repo, unfiltered."""
-    return [t.get("name", "") for t in gh_paginate(session, f"{API_ROOT}/repos/{repo}/tags") if t.get("name")]
-
-
 def diagnose_markers(session: requests.Session, repo: str, tag_pattern: str, deploy_source: str,
                      markers_total: int, deployment_frequency: int, latest_marker_at: str,
-                     provider: str = "github", api_root: str = None) -> list:
+                     provider: str = DEFAULT_PROVIDER, api_root: str = None) -> list:
     """Explains a deploy count of 0 instead of leaving it mute — the difference
     between 'they didn't deploy' and 'the repo isn't instrumented' is invisible
     in the number alone, and only the second one is fixable.
 
     Costs nothing when markers were found inside the window: the extra API calls
-    run only on the paths that need evidence."""
+    run only on the paths that need evidence. A provider with no Releases API
+    (Bitbucket, Azure DevOps) has only one kind of marker, so there is no
+    "other source" to compare against and no draft to look for.
+
+    With deploy_source "merge" the marker is the merge itself: there is no
+    pattern to mismatch and no draft to explain, so a zero is a factual note
+    and no API call is made."""
     if deploy_source == "merge":
-        # The marker is the merge itself: there is no pattern to mismatch and no
-        # draft to explain. A zero is a factual note, never a configuration gap.
         if deployment_frequency == 0:
             return [make_issue(
                 "no_merged_prs_in_window", "none",
-                f"{repo}: 0 {PROVIDER_PR_LABELS.get(provider, 'PRs')} merged into the production branch in the "
+                f"{repo}: 0 {PROVIDERS[provider]['changes']} merged into the production branch in the "
                 "window — with deploy_source 'merge' every merge is a deploy, so nothing was deployed.",
                 evidence={"deploy_source": deploy_source},
             )]
@@ -940,25 +1250,20 @@ def diagnose_markers(session: requests.Session, repo: str, tag_pattern: str, dep
 
     issues = []
     pattern = re.compile(tag_pattern)
-    label = provider_label(provider)
-    if provider == "github":
-        releases = get_release_tag_names(session, repo)
-        tag_names = get_all_tag_names(session, repo)
-    elif provider == "gitlab":
-        releases = get_gitlab_release_tag_names(session, repo, api_root)
-        tag_names = get_gitlab_all_tag_names(session, repo, api_root)
-    elif provider == "bitbucket":
-        releases = None
-        tag_names = get_bitbucket_all_tag_names(session, repo, api_root)
-    else:  # azure
-        releases = None
-        tag_names = get_azure_all_tag_names(session, repo, api_root)
-
-    if deploy_source == "tag" or releases is None:
-        own_names, own_label = tag_names, "tags"
-        other_names, other_label = (releases["published"] if releases else []), f"published {label} Releases"
+    api = _provider_api(provider, api_root)
+    spec = PROVIDERS[provider]
+    if "release_names" in api:
+        releases = api["release_names"](session, repo)
     else:
-        own_names, own_label = releases["published"], f"published {label} Releases"
+        releases = {"published": [], "draft": []}
+    tag_names = api["tag_names"](session, repo)
+    releases_label = spec["releases_label"]
+
+    if deploy_source == "tag":
+        own_names, own_label = tag_names, "tags"
+        other_names, other_label = releases["published"], releases_label
+    else:
+        own_names, own_label = releases["published"], releases_label
         other_names, other_label = tag_names, "tags"
 
     if not own_names:
@@ -977,13 +1282,13 @@ def diagnose_markers(session: requests.Session, repo: str, tag_pattern: str, dep
                       "names_total": len(own_names)},
         ))
 
-    if deploy_source == "release" and releases is not None:
+    if deploy_source == "release":
         matching_drafts = [n for n in releases["draft"] if pattern.match(n)]
         if matching_drafts:
             issues.append(make_issue(
                 "matching_releases_all_draft", "partial",
-                f"{repo}: {len(matching_drafts)} Release(s) matching tag_pattern exist but are all drafts — "
-                "drafts are not counted as deploys.",
+                f"{repo}: {len(matching_drafts)} Release(s) matching tag_pattern exist but are all "
+                f"{spec['unpublished_label']} — {spec['unpublished_label']} are not counted as deploys.",
                 evidence={"draft_tags": matching_drafts[:EVIDENCE_SAMPLE_SIZE]},
             ))
 
@@ -1030,10 +1335,10 @@ ISSUE_CODES = (
 )
 
 # Codes with no entry in troubleshooting.md, on purpose. api_error is a
-# catch-all for unexpected API failures (any provider): there is no fixed
-# remediation, so the report shows the raw message. Kept as an explicit list so
-# the drift test can tell "deliberate exception" from "someone forgot to
-# document a code".
+# catch-all for unexpected API failures on any provider: there is no fixed
+# remediation, so the report shows the raw message (which names the provider).
+# Kept as an explicit list so the drift test can tell "deliberate exception"
+# from "someone forgot to document a code".
 NO_GUIDANCE_CODES = ("api_error",)
 
 
@@ -1127,55 +1432,23 @@ def has_blocked(result: dict) -> bool:
     return any(i["impact"] == "blocked" for i in iter_issues(result))
 
 
-def _provider_fetchers(provider: str, api_root: str):
-    """The four calls compute_repo_metrics needs, bound to one provider. Kept as
-    module-level functions (looked up at call time) so tests can patch them."""
-    if provider == "gitlab":
-        return {
-            "releases": lambda s, r, p, now: get_gitlab_releases(s, r, p, now=now, api_root=api_root),
-            "tags": lambda s, r, p: get_gitlab_tags(s, r, p, api_root=api_root),
-            "merged": lambda s, r, b, a, z: get_gitlab_merged_mrs_between(s, r, b, a, z, api_root=api_root),
-            "first_commit": lambda s, r, n: get_gitlab_mr_first_commit_ts(s, r, n, api_root=api_root),
-        }
-    if provider == "bitbucket":
-        return {
-            "releases": None,
-            "tags": lambda s, r, p: get_bitbucket_tags(s, r, p, api_root=api_root),
-            "merged": lambda s, r, b, a, z: get_bitbucket_merged_prs_between(s, r, b, a, z, api_root=api_root),
-            "first_commit": lambda s, r, n: get_bitbucket_pr_first_commit_ts(s, r, n, api_root=api_root),
-        }
-    if provider == "azure":
-        return {
-            "releases": None,
-            "tags": lambda s, r, p: get_azure_tags(s, r, p, api_root=api_root),
-            "merged": lambda s, r, b, a, z: get_azure_merged_prs_between(s, r, b, a, z, api_root=api_root),
-            "first_commit": lambda s, r, n: get_azure_pr_first_commit_ts(s, r, n, api_root=api_root),
-        }
-    return {
-        "releases": lambda s, r, p, now: get_prod_releases(s, r, p),
-        "tags": lambda s, r, p: get_prod_tags(s, r, p),
-        "merged": lambda s, r, b, a, z: get_merged_prs_between(s, r, b, a, z),
-        "first_commit": lambda s, r, n: get_pr_first_commit_ts(s, r, n),
-    }
-
-
 def compute_repo_metrics(session: requests.Session, repo: str, branch: str,
                           tag_pattern: str, window_days: int, now: datetime,
-                          deploy_source: str = "release", provider: str = "github",
+                          deploy_source: str = "release", provider: str = DEFAULT_PROVIDER,
                           api_root: str = None):
     issues = []
     window_start = now - timedelta(days=window_days)
-    fetch = _provider_fetchers(provider, api_root)
-    pr_label = PROVIDER_PR_LABELS.get(provider, "PRs")
+    api = _provider_api(provider, api_root, now)
+    spec = PROVIDERS[provider]
 
     if deploy_source == "merge":
-        return _compute_merge_metrics(session, repo, branch, window_days, window_start, now, fetch, pr_label, provider)
+        return _compute_merge_metrics(session, repo, branch, window_start, now, api, spec)
 
-    if deploy_source == "tag" or fetch["releases"] is None:
-        all_deploys = fetch["tags"](session, repo, tag_pattern)
+    if deploy_source == "tag":
+        all_deploys = api["tag"](session, repo, tag_pattern)
         marker_label = "Tag"
     else:
-        all_deploys = fetch["releases"](session, repo, tag_pattern, now)
+        all_deploys = api["release"](session, repo, tag_pattern)
         marker_label = "Release"
     deploys_in_window = [d for d in all_deploys if window_start <= d["published_at"] <= now]
     tag_to_idx = {d["tag"]: i for i, d in enumerate(all_deploys)}
@@ -1198,20 +1471,22 @@ def compute_repo_metrics(session: requests.Session, repo: str, branch: str,
             ))
             continue
         prev_dep = all_deploys[idx - 1]
-        prs = fetch["merged"](session, repo, branch, prev_dep["published_at"], dep["published_at"])
+        prs = api["merged"](session, repo, branch, prev_dep["published_at"], dep["published_at"])
         if not prs:
             issues.append(make_issue(
                 "no_prs_in_range", "partial",
-                f"{marker_label} {dep['tag']}: 0 merged {pr_label} found in the range — check the base branch/convention.",
+                f"{marker_label} {dep['tag']}: 0 merged {spec['changes']} found in the range — check the base "
+                "branch/convention.",
                 evidence={"tag": dep["tag"], "prev_tag": prev_dep["tag"], "prod_branch": branch},
             ))
             continue
         for pr in prs:
-            first_commit_ts = fetch["first_commit"](session, repo, pr["number"])
+            first_commit_ts = api["first_commit"](session, repo, pr["number"])
             if first_commit_ts is None:
                 issues.append(make_issue(
                     "pr_first_commit_unfetchable", "partial",
-                    f"PR #{pr['number']}: could not fetch the first commit, it's excluded.",
+                    f"{spec['change']} {spec['change_ref']}{pr['number']}: could not fetch the first commit, "
+                    "it's excluded.",
                     evidence={"pr": pr["number"], "tag": dep["tag"]},
                 ))
                 continue
@@ -1234,7 +1509,6 @@ def compute_repo_metrics(session: requests.Session, repo: str, branch: str,
 
     return {
         "repo": repo,
-        "provider": provider,
         "prod_branch": branch,
         "deploy_source": deploy_source,
         "window_start": fmt_ts(window_start),
@@ -1253,25 +1527,31 @@ def compute_repo_metrics(session: requests.Session, repo: str, branch: str,
     }
 
 
-def _compute_merge_metrics(session, repo, branch, window_days, window_start, now, fetch, pr_label, provider):
+def _change_name(spec: dict, number) -> str:
+    """How a PR/MR is named in a message and in a merge deploy's tag:
+    "PR #12" on GitHub, Bitbucket and Azure DevOps, "MR !12" on GitLab."""
+    return f"{spec['change']} {spec['change_ref']}{number}"
+
+
+def _compute_merge_metrics(session, repo: str, branch: str, window_start: datetime, now: datetime,
+                           api: dict, spec: dict) -> dict:
     """deploy_source "merge": every PR/MR merged into the production branch
-    inside the window is one deploy, dated by its merge; its lead time runs from
-    its first commit to that merge. Nothing is bounded by a previous marker, so
-    the whole window is one population and there is no "first marker" gap."""
+    inside the window is one deploy, dated by its merge; its lead time runs
+    from its first commit to that merge. Nothing is bounded by a previous
+    marker, so the whole window is one population and there is no "first
+    marker" gap. Same result shape as the marker path, with each merge's
+    "PR #n" / "MR !n" standing in for the tag."""
     issues = []
-    merged = fetch["merged"](session, repo, branch, window_start, now)
-    # A provider whose listing does not carry the merge timestamp (GitHub's
-    # Search API) is asked for it per PR.
     deploys = []
-    for pr in merged:
+    for pr in api["merged"](session, repo, branch, window_start, now):
         merged_at = pr.get("merged_at")
-        if merged_at is None and provider == "github":
-            merged_at = get_pr_merged_at(session, repo, pr["number"])
+        if merged_at is None and "merged_at" in api:
+            merged_at = api["merged_at"](session, repo, pr["number"])
         if merged_at is None:
             issues.append(make_issue(
                 "pr_first_commit_unfetchable", "partial",
-                f"PR #{pr['number']}: could not resolve its merge time, it's excluded.",
-                evidence={"pr": pr["number"]},
+                f"{_change_name(spec, pr['number'])}: could not resolve its merge time, it's excluded.",
+                evidence={"pr": pr["number"], "deploy_source": "merge"},
             ))
             continue
         deploys.append({**pr, "merged_at": merged_at})
@@ -1279,12 +1559,12 @@ def _compute_merge_metrics(session, repo, branch, window_days, window_start, now
 
     lead_times_hours, lt_detail = [], []
     for pr in deploys:
-        first_commit_ts = fetch["first_commit"](session, repo, pr["number"])
+        first_commit_ts = api["first_commit"](session, repo, pr["number"])
         if first_commit_ts is None:
             issues.append(make_issue(
                 "pr_first_commit_unfetchable", "partial",
-                f"PR #{pr['number']}: could not fetch the first commit, it's excluded.",
-                evidence={"pr": pr["number"]},
+                f"{_change_name(spec, pr['number'])}: could not fetch the first commit, it's excluded.",
+                evidence={"pr": pr["number"], "deploy_source": "merge"},
             ))
             continue
         lead_time_h = (pr["merged_at"] - first_commit_ts).total_seconds() / 3600
@@ -1292,22 +1572,22 @@ def _compute_merge_metrics(session, repo, branch, window_days, window_start, now
         lt_detail.append({
             "pr": pr["number"],
             "title": pr.get("title", ""),
-            "deploy_tag": f"PR #{pr['number']}",
+            "deploy_tag": _change_name(spec, pr["number"]),
             "first_commit_ts": fmt_ts(first_commit_ts),
             "deploy_ts": fmt_ts(pr["merged_at"]),
             "lead_time_hours": round(lead_time_h, 1),
         })
+
     lead_time_median_hours = round(statistics.median(lead_times_hours), 1) if lead_times_hours else None
     return {
         "repo": repo,
-        "provider": provider,
         "prod_branch": branch,
         "deploy_source": "merge",
         "window_start": fmt_ts(window_start),
         "window_end": fmt_ts(now),
         "deployment_frequency": len(deploys),
-        "deploys_in_window": [{"tag": f"PR #{d['number']}", "published_at": fmt_ts(d["merged_at"]), "url": d.get("url")}
-                              for d in deploys],
+        "deploys_in_window": [{"tag": _change_name(spec, d["number"]), "published_at": fmt_ts(d["merged_at"]),
+                               "url": d.get("url")} for d in deploys],
         "lead_time_median_hours": lead_time_median_hours,
         "lead_time_n": len(lead_times_hours),
         "lead_time_detail": lt_detail,
@@ -1423,11 +1703,38 @@ def _render_practice_guidance(catalog_entries, lines: list) -> None:
         lines.append("")
 
 
-def format_human_summary(result: dict, window_days: int) -> str:
+def _render_report_metadata(window_days: int, date: str, lines: list) -> None:
+    """The fixed closing block every Somnio report ends with. It is the same
+    on every run apart from the date and the window, so it carries no
+    interpretation. The `Generated by` and `Skill` cells are anchors the
+    reports pipeline reads: keep their spelling."""
+    lines.append("## Report Metadata")
+    lines.append("")
+    lines.append("| Field | Value |")
+    lines.append("|-------|-------|")
+    lines.append(f"| Generated by | Somnio CLI v{SOMNIO_VERSION} |")
+    lines.append(f"| Skill | {REPORT_TYPE} |")
+    lines.append(f"| Date | {date} |")
+    lines.append(f"| Measurement window | {window_days} days |")
+    lines.append(
+        "| Somnio AI Tools | "
+        "https://github.com/somnio-software/somnio-ai-tools |"
+    )
+
+
+def format_human_summary(result: dict, window_days: int, date: str = None) -> str:
     """Renders the fetched data as a readable Markdown report — the same
     numbers printed to stdout, plus, for every problem found, the steps to fix
-    it. Pure formatting: no interpretation, no ranking, no number and no
-    guidance that isn't already in the result."""
+    it, closed by the Report Metadata table. Pure formatting: no
+    interpretation, no ranking, no number and no guidance that isn't already
+    in the result.
+
+    `date` is the run's YYYY-MM-DD; it defaults to the date of the result's
+    `generated_at` (the same `now`), and to today (UTC) for a hand-built
+    result that has neither."""
+    if date is None:
+        fallback_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        date = (result.get("generated_at") or "")[:10] or fallback_date
     lines = []
 
     root_issues = result.get("issues", [])
@@ -1446,9 +1753,13 @@ def format_human_summary(result: dict, window_days: int) -> str:
                 lines.append("")
                 _render_issue_groups(r.get("issues", []), lines)
                 continue
-            provider = r.get("provider", "github")
-            provider_note = "" if provider == "github" else f" · {provider_label(provider)}"
-            lines.append(f"## `{r['repo']}` ({type_label}{provider_note}) — deploy_source: {r.get('deploy_source', 'release')}")
+            header = f"## `{r['repo']}` ({type_label}) — deploy_source: {r.get('deploy_source', 'release')}"
+            # The provider is named only when it isn't the default, so a
+            # GitHub repo's heading reads exactly as it always has.
+            provider = r.get("provider", DEFAULT_PROVIDER)
+            if provider != DEFAULT_PROVIDER:
+                header += f" — provider: {provider}"
+            lines.append(header)
             lines.append("")
             lines.append(f"- **Deployment Frequency** (window {window_days}d): {r['deployment_frequency']}")
             if r["lead_time_median_hours"] is not None:
@@ -1459,6 +1770,9 @@ def format_human_summary(result: dict, window_days: int) -> str:
             _render_issue_groups(r.get("issues", []), lines)
 
     _render_practice_guidance(result.get("practice_guidance"), lines)
+    if lines and lines[-1] != "":
+        lines.append("")
+    _render_report_metadata(window_days, date, lines)
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1473,9 +1787,10 @@ def _positive_int(value: str) -> int:
 
 
 def validate_scoped_overrides(args) -> None:
-    """--branch and --deploy-source are one-off overrides of a SINGLE project;
-    it makes no sense to apply them to all if --project isn't specified.
-    Separated from main() so the validation can be tested without invoking the CLI."""
+    """--branch, --deploy-source and --provider are one-off overrides of a
+    SINGLE project; it makes no sense to apply them to all if --project isn't
+    specified. Separated from main() so the validation can be tested without
+    invoking the CLI."""
     if args.branch and not args.project:
         raise ValueError("--branch requires --project (the override is one-off, it isn't applied to all projects).")
     if args.deploy_source and not args.project:
@@ -1484,8 +1799,41 @@ def validate_scoped_overrides(args) -> None:
         raise ValueError("--provider requires --project (the override is one-off, it isn't applied to all projects).")
 
 
+def effective_deploy_source(repo_cfg: dict) -> str:
+    """The repo's deploy_source, or its provider's default when omitted:
+    "release" on GitHub and GitLab, "tag" on Bitbucket and Azure DevOps (no
+    Releases API)."""
+    explicit = repo_cfg.get("deploy_source")
+    if explicit:
+        return explicit
+    return "release" if _has_releases(repo_provider(repo_cfg)) else "tag"
+
+
+def _has_releases(provider: str) -> bool:
+    """False only for a known provider with no Releases API (Bitbucket, Azure
+    DevOps). An
+    unknown provider is validate_providers' error to report, not this one's."""
+    return provider not in PROVIDERS or PROVIDERS[provider]["releases_label"] is not None
+
+
+def validate_providers(projects) -> None:
+    """Validates that each repo's provider is one of the supported values, and
+    that an Azure DevOps repo is named `organization/project/repository`."""
+    for project in projects:
+        for repo_cfg in project["repos"]:
+            provider = repo_provider(repo_cfg)
+            if provider not in VALID_PROVIDERS:
+                raise ValueError(
+                    f"invalid provider '{provider}' in repo {repo_cfg['repo']} "
+                    f"(valid: {', '.join(VALID_PROVIDERS)})."
+                )
+            if provider == "azure":
+                azure_repo_parts(repo_cfg["repo"])
+
+
 def validate_deploy_sources(projects) -> None:
-    """Validates that each repo's deploy_source is one of the supported values.
+    """Validates that each repo's deploy_source is one of the supported values,
+    and that "release" is only used on a provider that has Releases.
     Separated from main() so the validation can be tested without touching the real config."""
     for project in projects:
         for repo_cfg in project["repos"]:
@@ -1495,17 +1843,61 @@ def validate_deploy_sources(projects) -> None:
                     f"invalid deploy_source '{ds}' in repo {repo_cfg['repo']} "
                     f"(valid: {', '.join(VALID_DEPLOY_SOURCES)})."
                 )
-            provider = repo_cfg.get("provider", "github")
-            if ds == "release" and provider in PROVIDERS_WITHOUT_RELEASES:
+            provider = repo_provider(repo_cfg)
+            if ds == "release" and not _has_releases(provider):
                 raise ValueError(
-                    f"deploy_source 'release' is not available on {provider_label(provider)} (repo {repo_cfg['repo']}): "
-                    "it has no Releases API — use 'tag' or 'merge'."
+                    f"deploy_source 'release' is not supported in repo {repo_cfg['repo']}: "
+                    f"{provider_label(provider)} has no Releases API — use \"tag\" or \"merge\" (or omit the field)."
                 )
 
 
-def classify_github_error(repo: str, message: str) -> dict:
-    """GitHub-flavoured alias of classify_api_error, kept for callers/tests."""
-    return classify_api_error("github", repo, message)
+def validate_api_base(projects) -> None:
+    """`api_base` points GitHub (Enterprise) or GitLab (self-hosted) at another
+    API root. A provider whose PROVIDERS entry says `api_base: False`
+    (Bitbucket and Azure DevOps, cloud only) rejects it. An unknown provider is
+    validate_providers' error to report, not this one's."""
+    for project in projects:
+        for repo_cfg in project["repos"]:
+            provider = repo_provider(repo_cfg)
+            if repo_cfg.get("api_base") and provider in PROVIDERS and not PROVIDERS[provider]["api_base"]:
+                raise ValueError(
+                    f"api_base is not supported in repo {repo_cfg['repo']}: {provider_label(provider)} "
+                    f"support is {provider_label(provider)} Cloud only."
+                )
+
+
+def classify_api_error(provider: str, repo: str, message: str) -> dict:
+    """Maps an exception raised mid-measurement onto a code, so an access
+    problem reaches the report with steps instead of as raw text.
+
+    Matches on the START of the message, never a substring search: the message
+    embeds the request URL (and, for the generic shape, the provider's response
+    body), so a repo named `org/app-401` would otherwise be reported as an auth
+    failure and its owner sent to reissue a perfectly good token. The prefixes
+    below are the shapes gh_paginate, gitlab_paginate, bitbucket_paginate and
+    azure_paginate raise."""
+    label = provider_label(provider)
+    if message.startswith("401"):
+        return make_issue("token_unauthorized", "blocked",
+                          f"{repo}: 401 Unauthorized from the {label} API — the credential is not valid for this repo.")
+    if message.startswith("Rate limit reached"):
+        return make_issue("rate_limited", "blocked",
+                          f"{repo}: {label} API rate limit reached — it could not be measured in this run.")
+    if message.startswith("404"):
+        return make_issue("repo_unreachable", "blocked",
+                          f"{repo}: the {label} API returned 404 — the repo is unreachable with this credential, "
+                          "it could not be measured.",
+                          evidence={"status": 404})
+    return make_issue("api_error", "blocked", f"{repo}: {message}")
+
+
+def _with_provider(repo_result: dict, provider: str) -> dict:
+    """Records the provider on a repo result. Omitted for the default
+    (GitHub), so a GitHub-only run's JSON is unchanged and a consumer reads a
+    missing `provider` as "github"."""
+    if provider != DEFAULT_PROVIDER:
+        repo_result["provider"] = provider
+    return repo_result
 
 
 def build_result(session, projects, tag_pattern: str, window_days: int, now: datetime,
@@ -1514,10 +1906,12 @@ def build_result(session, projects, tag_pattern: str, window_days: int, now: dat
     contributes its problems to the report and the run continues with the next
     one — a broken access on one repo must not cost the numbers of the others.
 
-    `session` is the GitHub session; `extra_sessions` maps the other providers
-    in play to theirs ({"gitlab": ..., "bitbucket": ..., "azure": ...})."""
-    extra_sessions = extra_sessions or {}
+    `session` is the GitHub one; `extra_sessions` maps every other provider
+    in play to its own session. Each repo is measured with its provider's."""
+    sessions = {DEFAULT_PROVIDER: session, **(extra_sessions or {})}
     result = {
+        "skill": REPORT_TYPE,
+        "generator_version": SOMNIO_VERSION,
         "generated_at": fmt_ts(now),
         "window_days": window_days,
         "tag_pattern": tag_pattern,
@@ -1530,18 +1924,19 @@ def build_result(session, projects, tag_pattern: str, window_days: int, now: dat
         for repo_cfg in project["repos"]:
             repo = repo_cfg["repo"]
             branch = repo_cfg["prod_branch"]
-            provider = repo_cfg.get("provider", "github")
-            api_root = repo_cfg.get("api_base")
-            repo_session = session if provider == "github" else extra_sessions.get(provider)
             repo_tag_pattern = repo_cfg.get("tag_pattern", tag_pattern)
+            provider = repo_provider(repo_cfg)
+            api_root = repo_cfg.get("api_base")
             deploy_source = effective_deploy_source(repo_cfg)
-            base = {"repo": repo, "provider": provider, "prod_branch": branch, "deploy_source": deploy_source,
-                    "type": repo_cfg.get("type", [])}
+            repo_session = sessions.get(provider)
 
             issues = preflight_repo(repo_session, repo, branch, provider=provider, api_root=api_root)
             if any(i["impact"] == "blocked" for i in issues):
-                repos_result.append({**base, "measured": False,
-                                     "issues": issues, "warnings": [i["message"] for i in issues]})
+                repos_result.append(_with_provider({
+                    "repo": repo, "prod_branch": branch, "deploy_source": deploy_source,
+                    "type": repo_cfg.get("type", []), "measured": False,
+                    "issues": issues, "warnings": [i["message"] for i in issues],
+                }, provider))
                 continue
 
             try:
@@ -1554,81 +1949,100 @@ def build_result(session, projects, tag_pattern: str, window_days: int, now: dat
                 )
                 r["warnings"] = [i["message"] for i in r["issues"] if i["impact"] != "none"]
                 r["measured"] = True
-                r["provider"] = provider
                 r["type"] = repo_cfg.get("type", [])
-            except (GitHubError, ProviderError, requests.exceptions.RequestException, ValueError) as e:
+            except (*API_ERRORS, requests.exceptions.RequestException) as e:
                 issues = issues + [classify_api_error(provider, repo, str(e))]
-                r = {**base, "measured": False, "issues": issues, "warnings": [i["message"] for i in issues]}
-            repos_result.append(r)
+                r = {
+                    "repo": repo, "prod_branch": branch, "deploy_source": deploy_source,
+                    "type": repo_cfg.get("type", []), "measured": False,
+                    "issues": issues, "warnings": [i["message"] for i in issues],
+                }
+            repos_result.append(_with_provider(r, provider))
         result["projects"].append({"name": project["name"], "repos": repos_result})
     return result
 
 
+def no_credential_result(now: datetime, window_days: int, tag_pattern: str, providers: list = None) -> dict:
+    """The run can't measure anything, but it still produces a report: the
+    person who ran it ends up with a file stating what happened and how to fix
+    it, instead of a stderr line that scrolls away. `providers` are the ones in
+    play for the run (default: GitHub only); with more than one, the message
+    names every provider that was missing a credential."""
+    providers = providers or [DEFAULT_PROVIDER]
+    if len(providers) == 1:
+        message = f"No {provider_label(providers[0])} credential found — nothing could be measured in this run."
+    else:
+        labels = ", ".join(provider_label(p) for p in providers)
+        message = f"No credential found for any provider in this run ({labels}) — nothing could be measured."
+    return {
+        "skill": REPORT_TYPE,
+        "generator_version": SOMNIO_VERSION,
+        "generated_at": fmt_ts(now),
+        "window_days": window_days,
+        "tag_pattern": tag_pattern,
+        "issues": [make_issue("no_credential", "blocked", message)],
+        "projects": [],
+    }
+
+
 def providers_in_play(projects) -> list:
-    """Providers referenced by the selected projects, in first-seen order."""
+    """Every provider the given projects use, once each, in first-seen order."""
     seen = []
     for project in projects:
         for repo_cfg in project["repos"]:
-            provider = repo_cfg.get("provider", "github")
+            provider = repo_provider(repo_cfg)
             if provider not in seen:
                 seen.append(provider)
     return seen
 
 
 def no_credential_repo_result(repo_cfg: dict) -> dict:
-    """The stub a repo gets when its provider has no credential: same shape as
-    any other unmeasurable repo, so the report reads the same."""
-    provider = repo_cfg.get("provider", "github")
-    issue = make_issue("no_credential", "blocked",
-                       f"{repo_cfg['repo']}: no {provider_label(provider)} credential found — it could not be "
-                       "measured in this run.")
-    return {"repo": repo_cfg["repo"], "provider": provider, "prod_branch": repo_cfg.get("prod_branch"),
-            "deploy_source": effective_deploy_source(repo_cfg), "type": repo_cfg.get("type", []),
-            "measured": False, "issues": [issue], "warnings": [issue["message"]]}
+    """An unmeasured repo whose provider has no credential in this run, shaped
+    like any other unmeasured repo. Used when other providers in the run do
+    have one, so only this provider's repos are lost."""
+    provider = repo_provider(repo_cfg)
+    issue = make_issue(
+        "no_credential", "blocked",
+        f"{repo_cfg['repo']}: no {provider_label(provider)} credential found — this repo could not be "
+        "measured in this run.",
+        evidence={"provider": provider},
+    )
+    return _with_provider({
+        "repo": repo_cfg["repo"], "prod_branch": repo_cfg.get("prod_branch"),
+        "deploy_source": effective_deploy_source(repo_cfg),
+        "type": repo_cfg.get("type", []), "measured": False,
+        "issues": [issue], "warnings": [issue["message"]],
+    }, provider)
 
 
 def split_by_credential(projects, sessions: dict):
-    """Separates the repos whose provider has a session from those that don't.
-    Returns (measurable_projects, stubs) where stubs maps project name -> list
-    of no-credential repo results, to be merged back by merge_stub_repos."""
+    """Splits the projects into what can be measured (repos whose provider has
+    a session) and, per project name, a `no_credential` stub for every other
+    repo. Every project stays in the measurable list, even with no repos left,
+    so merge_stub_repos keeps the config's project order."""
     measurable, stubs = [], {}
     for project in projects:
-        kept = []
+        repos = []
         for repo_cfg in project["repos"]:
-            if sessions.get(repo_cfg.get("provider", "github")):
-                kept.append(repo_cfg)
-            else:
+            if sessions.get(repo_provider(repo_cfg)) is None:
                 stubs.setdefault(project["name"], []).append(no_credential_repo_result(repo_cfg))
-        measurable.append({**project, "repos": kept})
+            else:
+                repos.append(repo_cfg)
+        measurable.append({**project, "repos": repos})
     return measurable, stubs
 
 
 def merge_stub_repos(result: dict, stubs: dict) -> None:
-    """Appends the no-credential stubs to their project's repos, in place."""
-    for project in result["projects"]:
-        project["repos"].extend(stubs.get(project["name"], []))
+    """Appends each project's `no_credential` stubs after its measured repos,
+    in place. A project the result doesn't have yet is added."""
+    by_name = {p["name"]: p for p in result["projects"]}
     for name, repos in stubs.items():
-        if not any(p["name"] == name for p in result["projects"]):
+        if name in by_name:
+            by_name[name]["repos"].extend(repos)
+        else:
             result["projects"].append({"name": name, "repos": list(repos)})
 
 
-def no_credential_result(now: datetime, window_days: int, tag_pattern: str, providers: list = None) -> dict:
-    """The run can't measure anything, but it still produces a report: the
-    person who ran it ends up with a file stating what happened and how to fix
-    it, instead of a stderr line that scrolls away."""
-    labels = [provider_label(p) for p in (providers or ["github"])]
-    listed = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + " or " + labels[-1]
-    return {
-        "generated_at": fmt_ts(now),
-        "window_days": window_days,
-        "tag_pattern": tag_pattern,
-        "issues": [make_issue("no_credential", "blocked",
-                              f"No {listed} credential found — nothing could be measured in this run.")],
-        "projects": [],
-    }
-
-
-REPORT_TYPE = "dora-metrics"
 NO_REPOS_SLUG = "no-repositories"
 
 
@@ -1675,10 +2089,10 @@ def single_repo_result(result: dict, project: dict, repo: dict) -> dict:
 
 def write_output(result: dict, window_days: int, out_dir: str, now: datetime) -> None:
     output_json = json.dumps(result, indent=2, ensure_ascii=False)
-    summary = format_human_summary(result, window_days)
+    date = now.strftime("%Y-%m-%d")
+    summary = format_human_summary(result, window_days, date=date)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-        date = now.strftime("%Y-%m-%d")
         slugs = repo_file_slugs(result)
         bases = []
 
@@ -1692,7 +2106,7 @@ def write_output(result: dict, window_days: int, out_dir: str, now: datetime) ->
                 )
                 per_repo = single_repo_result(result, project, repo)
                 with open(f"{base}.md", "w") as f:
-                    f.write(format_human_summary(per_repo, window_days))
+                    f.write(format_human_summary(per_repo, window_days, date=date))
                 bases.append(base)
 
         if not bases:
@@ -1712,18 +2126,42 @@ def write_output(result: dict, window_days: int, out_dir: str, now: datetime) ->
     print(output_json)
 
 
+# provider -> (resolve its credential, open a session with it). Resolved
+# lazily: a provider no repo uses is never asked for a credential.
+_CREDENTIALS = {
+    "github": (lambda: get_github_token(), lambda token: gh_session(token)),
+    "gitlab": (lambda: get_gitlab_token(), lambda token: gitlab_session(token)),
+    "bitbucket": (lambda: get_bitbucket_credential(), lambda cred: bitbucket_session(cred)),
+    "azure": (lambda: get_azure_credential(), lambda cred: azure_session(cred)),
+}
+
+
+def open_sessions(providers) -> dict:
+    """provider -> session, or None when that provider has no credential."""
+    sessions = {}
+    for provider in providers:
+        resolve, open_session = _CREDENTIALS[provider]
+        credential = resolve()
+        sessions[provider] = open_session(credential) if credential else None
+    return sessions
+
+
 def main():
-    ap = argparse.ArgumentParser(description="DORA fetching (Deployment Frequency + Lead Time) from the GitHub / GitLab / Bitbucket / Azure DevOps APIs.")
+    ap = argparse.ArgumentParser(
+        description="DORA fetching (Deployment Frequency + Lead Time) from the GitHub, GitLab, Bitbucket or "
+                    "Azure DevOps API.")
     ap.add_argument("--config", default=os.path.join(os.path.dirname(__file__), "..", "config", "projects.json"))
     ap.add_argument("--project", default=None, help="Project name to run (default: all projects in the config).")
-    ap.add_argument("--out-dir", default=None, help="Folder where the output JSON is saved (default: doesn't save, stdout only).")
+    ap.add_argument("--out-dir", default=None,
+                     help="Folder where one Markdown report per repo is saved (default: doesn't save, stdout only).")
     ap.add_argument("--branch", default=None, help="One-off override of prod_branch for this run (requires --project). Doesn't modify the config.")
     ap.add_argument("--deploy-source", default=None, choices=list(VALID_DEPLOY_SOURCES),
                      help="One-off override of deploy_source for this run (requires --project). Doesn't modify the config.")
+    ap.add_argument("--provider", default=None, choices=list(VALID_PROVIDERS),
+                     help="One-off override of provider for every repo of the project (requires --project). "
+                          "Doesn't modify the config.")
     ap.add_argument("--window-days", type=_positive_int, default=None,
                      help="One-off override of window_days for this run. Doesn't modify the config.")
-    ap.add_argument("--provider", default=None, choices=list(PROVIDERS),
-                     help="One-off override of provider for every repo of --project. Doesn't modify the config.")
     args = ap.parse_args()
 
     try:
@@ -1763,40 +2201,31 @@ def main():
 
     try:
         validate_providers(projects)
-        validate_api_base(projects)
         validate_deploy_sources(projects)
+        validate_api_base(projects)
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # One credential per provider in play. A provider without one does not
-    # block the others: its repos are reported as unmeasured, the rest measure.
-    sessions = {}
-    for provider in providers_in_play(projects):
-        if provider == "github":
-            token = get_github_token()
-            sessions[provider] = gh_session(token) if token else None
-        elif provider == "gitlab":
-            token = get_gitlab_token()
-            sessions[provider] = gitlab_session(token) if token else None
-        elif provider == "bitbucket":
-            cred = get_bitbucket_credential()
-            sessions[provider] = bitbucket_session(cred) if cred else None
-        else:
-            cred = get_azure_credential()
-            sessions[provider] = azure_session(cred) if cred else None
-
-    if not any(sessions.values()):
+    # Credentials are resolved per provider, only for the providers the
+    # selected repos use. An empty config still needs the GitHub one, as it
+    # always did.
+    providers = providers_in_play(projects) or [DEFAULT_PROVIDER]
+    sessions = open_sessions(providers)
+    if all(session is None for session in sessions.values()):
         # No hard exit: the report itself carries the problem and its steps.
-        result = no_credential_result(now, window_days, tag_pattern, providers=list(sessions))
+        result = no_credential_result(now, window_days, tag_pattern, providers=providers)
         hydrate_issues(result, guidance)
         attach_practice_guidance(result, practice_catalog)
         write_output(result, window_days, args.out_dir, now)
         sys.exit(1)
 
+    # A provider with no credential costs only its own repos: they become
+    # `no_credential` stubs and every other repo is measured normally.
     measurable, stubs = split_by_credential(projects, sessions)
-    result = build_result(sessions.get("github"), measurable, tag_pattern, window_days, now,
-                          extra_sessions={k: v for k, v in sessions.items() if k != "github"})
+    extra_sessions = {p: s for p, s in sessions.items() if p != DEFAULT_PROVIDER}
+    result = build_result(sessions.get(DEFAULT_PROVIDER), measurable, tag_pattern, window_days, now,
+                          extra_sessions=extra_sessions)
     merge_stub_repos(result, stubs)
     hydrate_issues(result, guidance)
     attach_practice_guidance(result, practice_catalog)

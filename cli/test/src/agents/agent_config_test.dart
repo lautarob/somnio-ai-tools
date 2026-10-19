@@ -3,6 +3,25 @@ import 'package:test/test.dart';
 
 void main() {
   group('AgentConfig.buildArgs', () {
+    test('approveFlags replaces autoApproveFlags in every prompt style', () {
+      for (final style in PromptStyle.values) {
+        final agent = AgentConfig(
+          id: 'test',
+          displayName: 'Test',
+          promptStyle: style,
+          promptFlag: '-p',
+          autoApproveFlags: const ['--allowedTools', 'Read'],
+          installPath: '{home}/.test',
+        );
+        final args = agent.buildArgs(
+          'prompt',
+          approveFlags: const ['--allowedTools', 'Read,Drive'],
+        );
+        expect(args, contains('Read,Drive'), reason: '$style');
+        expect(args, isNot(contains('Read')), reason: '$style');
+      }
+    });
+
     test('flag style places prompt after flag', () {
       const agent = AgentConfig(
         id: 'test',
@@ -27,9 +46,12 @@ void main() {
       );
       final args = agent.buildArgs('prompt');
       expect(args, [
-        '-p', 'prompt',
-        '--allowedTools', 'Read,Bash',
-        '--output-format', 'json',
+        '-p',
+        'prompt',
+        '--allowedTools',
+        'Read,Bash',
+        '--output-format',
+        'json',
       ]);
     });
 
@@ -84,7 +106,8 @@ void main() {
         'exec',
         '--dangerously-bypass-approvals-and-sandbox',
         '--json',
-        '--model', 'o4-mini',
+        '--model',
+        'o4-mini',
         'prompt',
       ]);
     });
@@ -100,8 +123,10 @@ void main() {
       );
       final args = agent.buildArgs('my prompt');
       expect(args, [
-        '--print', '--force',
-        '--output-format', 'json',
+        '--print',
+        '--force',
+        '--output-format',
+        'json',
         'my prompt',
       ]);
     });
@@ -184,6 +209,30 @@ void main() {
   });
 
   group('AgentConfig.resolvedExecutionRulesPath', () {
+    test('falls back to legacyExecutionRulesPath before installPath', () {
+      const agent = AgentConfig(
+        id: 'codex',
+        displayName: 'Codex',
+        installFormat: InstallFormat.skillDir,
+        installPath: '{home}/.codex/skills',
+        legacyExecutionRulesPath: '{home}/.codex/somnio_rules',
+      );
+      final path = agent.resolvedExecutionRulesPath(home: '/home/u');
+      expect(path, '/home/u/.codex/somnio_rules');
+    });
+
+    test('prefers executionRulesPath over legacyExecutionRulesPath', () {
+      const agent = AgentConfig(
+        id: 'x',
+        displayName: 'X',
+        installPath: '{home}/.x/commands',
+        executionRulesPath: '{home}/.x/rules',
+        legacyExecutionRulesPath: '{home}/.x/old_rules',
+      );
+      final path = agent.resolvedExecutionRulesPath(home: '/home/u');
+      expect(path, '/home/u/.x/rules');
+    });
+
     test('falls back to installPath when executionRulesPath is null', () {
       const agent = AgentConfig(
         id: 'claude',
@@ -245,10 +294,14 @@ void main() {
       );
       final args = agent.buildArgs('test prompt', model: 'sonnet');
       expect(args, [
-        '-p', 'test prompt',
-        '--allowedTools', 'Read,Bash,Glob,Grep,Write',
-        '--output-format', 'json',
-        '--model', 'sonnet',
+        '-p',
+        'test prompt',
+        '--allowedTools',
+        'Read,Bash,Glob,Grep,Write',
+        '--output-format',
+        'json',
+        '--model',
+        'sonnet',
       ]);
     });
 
@@ -264,10 +317,13 @@ void main() {
       );
       final args = agent.buildArgs('test prompt', model: 'gemini-2.5-flash');
       expect(args, [
-        '-p', 'test prompt',
+        '-p',
+        'test prompt',
         '--yolo',
-        '-o', 'json',
-        '--model', 'gemini-2.5-flash',
+        '-o',
+        'json',
+        '--model',
+        'gemini-2.5-flash',
       ]);
     });
 
@@ -282,9 +338,12 @@ void main() {
       );
       final args = agent.buildArgs('test prompt', model: 'auto');
       expect(args, [
-        '--print', '--force',
-        '--output-format', 'json',
-        '--model', 'auto',
+        '--print',
+        '--force',
+        '--output-format',
+        'json',
+        '--model',
+        'auto',
         'test prompt',
       ]);
     });
@@ -333,8 +392,8 @@ void main() {
         installPath: '{home}/.test',
       );
       final instruction = agent.formatReadInstruction('/path/to/rule.md');
-      expect(instruction,
-          'Read and follow ALL instructions in /path/to/rule.md');
+      expect(
+          instruction, 'Read and follow ALL instructions in /path/to/rule.md');
     });
 
     test('uses custom template when provided', () {

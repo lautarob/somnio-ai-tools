@@ -8,6 +8,7 @@ import 'package:somnio/src/content/content_loader.dart';
 import 'package:somnio/src/content/skill_bundle.dart';
 import 'package:somnio/src/content/workflow_skill.dart';
 import 'package:somnio/src/installers/agent_installer.dart';
+import 'package:somnio/src/installers/skill_manifest.dart';
 import 'package:test/test.dart';
 import 'package:yaml/yaml.dart';
 
@@ -131,6 +132,20 @@ void main() {
       expect(result.ruleCount, greaterThan(0));
       expect(result.skippedCount, 0);
       expect(result.targetDirectory, endsWith('install'));
+    });
+
+    test('reports the names of the bundles it installed', () async {
+      final bundle = _seedBundle(repoRoot);
+      final installer = AgentInstaller(
+        logger: logger,
+        loader: loader,
+        agentConfig: agentFor(format: InstallFormat.markdown),
+      );
+
+      final result = await installer.install(bundles: [bundle]);
+
+      expect(result.installedSkills, [bundle.name]);
+      expect(result.failedSkills, isEmpty);
     });
 
     test('skillDir format writes agents/ files with resolved tiers', () async {
@@ -358,6 +373,8 @@ void main() {
       final result = await installer.install(bundles: [bad]);
 
       expect(result.skillCount, 0);
+      expect(result.installedSkills, isEmpty);
+      expect(result.failedSkills, ['missing']);
       verify(() => logger.err(any())).called(greaterThanOrEqualTo(1));
     });
   });
@@ -529,6 +546,22 @@ void main() {
 
       expect(counts.installed, 0);
       expect(counts.failed, 1);
+      expect(counts.installedNames, isEmpty);
+      expect(counts.failedNames, [skill.name]);
+    });
+
+    test('installWorkflowSkillsDetailed reports the installed names', () {
+      final skill = seedWorkflow();
+      final installer = AgentInstaller(
+        logger: logger,
+        loader: loader,
+        agentConfig: agentFor(format: InstallFormat.markdown),
+      );
+
+      final counts = installer.installWorkflowSkillsDetailed([skill]);
+
+      expect(counts.installedNames, [skill.name]);
+      expect(counts.failedNames, isEmpty);
     });
 
     test('a missing plan file is skipped, not counted as a failure', () {
@@ -800,6 +833,78 @@ void main() {
       expect(out, contains('# Workflow Builder'));
       expect(out, contains('> Builds workflows.'));
       expect(out, contains('Body.'));
+    });
+
+    test('skillDir: skips __pycache__ and bytecode files in assetDirectories',
+        () {
+      final skill = seedWorkflow(name: 'dora-pyc');
+      _writeFile(repoRoot, 'skills/dora-pyc/scripts/dora_metrics.py', 'ok\n');
+      final pycDir = Directory(
+        p.join(repoRoot, 'skills/dora-pyc/scripts/__pycache__'),
+      )..createSync(recursive: true);
+      // 0xFF / 0xFE are invalid UTF-8, like a real compiled .pyc.
+      File(p.join(pycDir.path, 'x.cpython-314.pyc'))
+          .writeAsBytesSync([0xFF, 0xFE, 0x00, 0x80]);
+      File(p.join(repoRoot, 'skills/dora-pyc/scripts/stray.pyo'))
+          .writeAsBytesSync([0xFF, 0xFE]);
+      final withAssets = WorkflowSkill(
+        id: skill.id,
+        name: skill.name,
+        displayName: skill.displayName,
+        description: skill.description,
+        planRelativePath: skill.planRelativePath,
+        assetDirectories: ['skills/dora-pyc/scripts'],
+      );
+      final installer = AgentInstaller(
+        logger: logger,
+        loader: loader,
+        agentConfig: agentFor(format: InstallFormat.skillDir),
+      );
+
+      final count = installer.installWorkflowSkills([withAssets]);
+
+      expect(count, 1);
+      final scriptsDir = p.join(tmp.path, 'install', 'dora-pyc', 'scripts');
+      expect(File(p.join(scriptsDir, 'dora_metrics.py')).readAsStringSync(),
+          'ok\n');
+      expect(
+          Directory(p.join(scriptsDir, '__pycache__')).existsSync(), isFalse);
+      final leaked = Directory(p.join(tmp.path, 'install'))
+          .listSync(recursive: true)
+          .map((e) => e.path)
+          .where((e) =>
+              e.contains('__pycache__') ||
+              e.endsWith('.pyc') ||
+              e.endsWith('.pyo'));
+      expect(leaked, isEmpty);
+    });
+
+    test('skillDir: skips .DS_Store in assetDirectories', () {
+      final skill = seedWorkflow(name: 'dora-ds');
+      _writeFile(repoRoot, 'skills/dora-ds/scripts/dora_metrics.py', 'ok\n');
+      File(p.join(repoRoot, 'skills/dora-ds/scripts/.DS_Store'))
+          .writeAsBytesSync([0xFF, 0xFE, 0x00, 0x80]);
+      final withAssets = WorkflowSkill(
+        id: skill.id,
+        name: skill.name,
+        displayName: skill.displayName,
+        description: skill.description,
+        planRelativePath: skill.planRelativePath,
+        assetDirectories: ['skills/dora-ds/scripts'],
+      );
+      final installer = AgentInstaller(
+        logger: logger,
+        loader: loader,
+        agentConfig: agentFor(format: InstallFormat.skillDir),
+      );
+
+      final count = installer.installWorkflowSkills([withAssets]);
+
+      expect(count, 1);
+      final scriptsDir = p.join(tmp.path, 'install', 'dora-ds', 'scripts');
+      expect(File(p.join(scriptsDir, 'dora_metrics.py')).readAsStringSync(),
+          'ok\n');
+      expect(File(p.join(scriptsDir, '.DS_Store')).existsSync(), isFalse);
     });
 
     test('skillDir: copies assetDirectories verbatim alongside SKILL.md', () {
@@ -1105,6 +1210,425 @@ void main() {
       );
 
       expect(installer.installedCount(), 1);
+    });
+  });
+  // ---------------------------------------------------------------------------
+  // Layout migration (markdown + somnio_rules -> skillDir)
+  // ---------------------------------------------------------------------------
+  group('layout migration', () {
+    late String installDir;
+    late String rulesDir;
+
+    setUp(() {
+      installDir = p.join(tmp.path, 'install');
+      rulesDir = p.join(tmp.path, 'somnio_rules');
+    });
+
+    /// The layout CLI releases before 3.2.12 used for Codex and similar agents.
+    AgentConfig legacyAgent() => AgentConfig(
+          id: 'test-agent',
+          displayName: 'Test Agent',
+          installPath: installDir,
+          executionRulesPath: rulesDir,
+        );
+
+    /// The same agent after its switch to skill directories.
+    AgentConfig migratedAgent() => AgentConfig(
+          id: 'test-agent',
+          displayName: 'Test Agent',
+          installFormat: InstallFormat.skillDir,
+          installPath: installDir,
+          legacyInstallFormat: InstallFormat.markdown,
+          legacyExecutionRulesPath: rulesDir,
+        );
+
+    AgentInstaller installerFor(AgentConfig agent) => AgentInstaller(
+          logger: logger,
+          loader: loader,
+          agentConfig: agent,
+          environment: const {},
+        );
+
+    test('replaces the recorded flat file and rules with a skill directory',
+        () async {
+      final bundle = _seedBundle(repoRoot);
+      await installerFor(legacyAgent()).install(bundles: [bundle]);
+      expect(
+          File(p.join(installDir, 'flutter_health.md')).existsSync(), isTrue);
+      expect(
+          Directory(p.join(rulesDir, bundle.planSubDir)).existsSync(), isTrue);
+
+      await installerFor(migratedAgent()).install(bundles: [bundle]);
+
+      expect(
+          File(p.join(installDir, 'flutter_health.md')).existsSync(), isFalse);
+      expect(
+        File(p.join(installDir, bundle.name, 'SKILL.md')).existsSync(),
+        isTrue,
+      );
+      expect(
+        File(p.join(installDir, bundle.name, 'references', 'architecture.md'))
+            .existsSync(),
+        isTrue,
+      );
+      expect(Directory(rulesDir).existsSync(), isFalse,
+          reason: 'the emptied legacy rules root is removed too');
+      expect(
+        SkillManifest.load(installDir).entryFor(bundle.name)!.paths,
+        [ManifestPath(ManifestRoot.install, bundle.name)],
+      );
+    });
+
+    test('keeps the legacy rules root while it still holds other content',
+        () async {
+      final bundle = _seedBundle(repoRoot);
+      await installerFor(legacyAgent()).install(bundles: [bundle]);
+      _writeFile(rulesDir, 'not-ours/rule.md', 'THEIRS');
+
+      await installerFor(migratedAgent()).install(bundles: [bundle]);
+
+      expect(
+          Directory(p.join(rulesDir, bundle.planSubDir)).existsSync(), isFalse);
+      expect(
+          File(p.join(rulesDir, 'not-ours', 'rule.md')).existsSync(), isTrue);
+    });
+
+    test('never prunes through a symlinked directory', () async {
+      final bundle = _seedBundle(repoRoot);
+      final outside = Directory(p.join(tmp.path, 'outside'))..createSync();
+      _writeFile(outside.path, 'sub/keep.md', 'THEIRS');
+      Directory(rulesDir).createSync(recursive: true);
+      Link(p.join(rulesDir, 'linked')).createSync(outside.path);
+      SkillManifest.load(installDir)
+        ..record(
+          skill: bundle.name,
+          kind: 'audit',
+          paths: const [ManifestPath(ManifestRoot.rules, 'linked/sub')],
+        )
+        ..save();
+
+      await installerFor(migratedAgent()).install(bundles: [bundle]);
+
+      expect(File(p.join(outside.path, 'sub', 'keep.md')).existsSync(), isTrue);
+    });
+
+    test('leaves legacy files no manifest records untouched', () async {
+      final bundle = _seedBundle(repoRoot);
+      _writeFile(installDir, 'flutter_health.md', 'HAND WRITTEN');
+
+      await installerFor(migratedAgent()).install(bundles: [bundle]);
+
+      expect(
+        File(p.join(installDir, 'flutter_health.md')).readAsStringSync(),
+        'HAND WRITTEN',
+      );
+    });
+
+    test('migrates workflow skills from flat files to skill directories', () {
+      _writeFile(
+        repoRoot,
+        'skills/git-commit-format/SKILL.md',
+        '---\ndescription: Writes commits.\n---\n\n# Commit\n',
+      );
+      const skill = WorkflowSkill(
+        id: 'git_commit_format',
+        name: 'git-commit-format',
+        displayName: 'Git Commit Format',
+        description: 'Writes commits.',
+        planRelativePath: 'skills/git-commit-format/SKILL.md',
+      );
+      installerFor(legacyAgent()).installWorkflowSkills([skill]);
+      expect(File(p.join(installDir, 'git_commit_format.md')).existsSync(),
+          isTrue);
+
+      installerFor(migratedAgent()).installWorkflowSkills([skill]);
+
+      expect(File(p.join(installDir, 'git_commit_format.md')).existsSync(),
+          isFalse);
+      expect(
+        File(p.join(installDir, 'git-commit-format', 'SKILL.md'))
+            .readAsStringSync(),
+        startsWith('---\nname: git-commit-format\n'),
+      );
+      expect(
+        SkillManifest.load(installDir).entryFor('git-commit-format')!.paths,
+        [const ManifestPath(ManifestRoot.install, 'git-commit-format')],
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Config-home override (e.g. CODEX_HOME)
+  // ---------------------------------------------------------------------------
+  group('config-home override', () {
+    AgentConfig agent() => AgentConfig(
+          id: 'test-agent',
+          displayName: 'Test Agent',
+          installFormat: InstallFormat.skillDir,
+          installPath: p.join(tmp.path, 'default-home', 'skills'),
+          configHome: p.join(tmp.path, 'default-home'),
+          configHomeVariable: 'TEST_AGENT_HOME',
+        );
+
+    test('installs under the directory the variable names', () async {
+      final bundle = _seedBundle(repoRoot);
+      final custom = p.join(tmp.path, 'custom-home');
+
+      final result = await AgentInstaller(
+        logger: logger,
+        loader: loader,
+        agentConfig: agent(),
+        environment: {'TEST_AGENT_HOME': custom},
+      ).install(bundles: [bundle]);
+
+      expect(result.targetDirectory, p.join(custom, 'skills'));
+      expect(
+        File(p.join(custom, 'skills', bundle.name, 'SKILL.md')).existsSync(),
+        isTrue,
+      );
+      expect(
+        File(p.join(custom, 'skills', SkillManifest.fileName)).existsSync(),
+        isTrue,
+      );
+      expect(Directory(p.join(tmp.path, 'default-home')).existsSync(), isFalse);
+    });
+
+    test('falls back to the default directory when the variable is blank',
+        () async {
+      final bundle = _seedBundle(repoRoot);
+
+      final result = await AgentInstaller(
+        logger: logger,
+        loader: loader,
+        agentConfig: agent(),
+        environment: const {'TEST_AGENT_HOME': '  '},
+      ).install(bundles: [bundle]);
+
+      expect(
+          result.targetDirectory, p.join(tmp.path, 'default-home', 'skills'));
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Moved install root (Antigravity: workflows -> skill directories)
+  // ---------------------------------------------------------------------------
+  group('moved install root', () {
+    late String legacyDir;
+    late String installDir;
+
+    setUp(() {
+      legacyDir = p.join(tmp.path, 'antigravity');
+      installDir = p.join(tmp.path, 'config', 'skills');
+    });
+
+    /// The workflow layout CLI releases before 3.2.15 used for Antigravity.
+    AgentConfig legacyAgent() => AgentConfig(
+          id: 'test-agent',
+          displayName: 'Test Agent',
+          installFormat: InstallFormat.workflow,
+          installPath: legacyDir,
+          filePrefix: 'somnio_',
+        );
+
+    /// The same agent after its move to a skills folder.
+    AgentConfig migratedAgent() => AgentConfig(
+          id: 'test-agent',
+          displayName: 'Test Agent',
+          installFormat: InstallFormat.skillDir,
+          installPath: installDir,
+          legacyInstallFormat: InstallFormat.workflow,
+          legacyInstallPath: legacyDir,
+          legacyExecutionRulesPath: p.join(legacyDir, 'somnio_rules'),
+          filePrefix: 'somnio_',
+        );
+
+    AgentInstaller installerFor(AgentConfig agent) => AgentInstaller(
+          logger: logger,
+          loader: loader,
+          agentConfig: agent,
+          environment: const {},
+        );
+
+    /// Seeds a bundle that also ships an Antigravity workflow file.
+    SkillBundle seedWorkflowBundle({String name = 'flutter-health'}) {
+      final base = _seedBundle(repoRoot, name: name);
+      final id = name.replaceAll('-', '_');
+      _writeFile(repoRoot, 'workflows/$id.md', '# $name workflow\n');
+      return SkillBundle(
+        id: base.id,
+        name: base.name,
+        displayName: base.displayName,
+        description: base.description,
+        planRelativePath: base.planRelativePath,
+        rulesDirectory: base.rulesDirectory,
+        templatePath: base.templatePath,
+        workflowPath: 'workflows/$id.md',
+      );
+    }
+
+    test('moves an audit bundle from the workflow layout to a skill dir',
+        () async {
+      final bundle = seedWorkflowBundle();
+      await installerFor(legacyAgent()).install(bundles: [bundle]);
+      final workflow = p.join(
+        legacyDir,
+        'global_workflows',
+        'somnio_flutter_health.md',
+      );
+      expect(File(workflow).existsSync(), isTrue);
+      expect(Directory(p.join(legacyDir, 'somnio_rules')).existsSync(), isTrue);
+
+      final result =
+          await installerFor(migratedAgent()).install(bundles: [bundle]);
+
+      expect(result.targetDirectory, installDir);
+      expect(
+        File(p.join(installDir, bundle.name, 'SKILL.md')).existsSync(),
+        isTrue,
+      );
+      expect(
+        SkillManifest.load(installDir).entryFor(bundle.name)!.paths,
+        [ManifestPath(ManifestRoot.install, bundle.name)],
+      );
+      expect(File(workflow).existsSync(), isFalse);
+      expect(
+        Directory(p.join(legacyDir, 'somnio_rules')).existsSync(),
+        isFalse,
+        reason: 'the per-file layout leaves only empty dirs, removed too',
+      );
+      expect(
+        File(p.join(legacyDir, SkillManifest.fileName)).existsSync(),
+        isFalse,
+        reason: 'the emptied legacy manifest is deleted',
+      );
+    });
+
+    test('leaves third-party workflows and the shared folder in place',
+        () async {
+      final bundle = seedWorkflowBundle();
+      await installerFor(legacyAgent()).install(bundles: [bundle]);
+      _writeFile(legacyDir, 'global_workflows/deploy.md', 'THEIRS');
+
+      await installerFor(migratedAgent()).install(bundles: [bundle]);
+
+      expect(
+        File(p.join(legacyDir, 'global_workflows', 'deploy.md'))
+            .readAsStringSync(),
+        'THEIRS',
+      );
+    });
+
+    test('keeps legacy entries for skills that were not reinstalled', () async {
+      final kept = seedWorkflowBundle(name: 'nestjs-health');
+      final moved = seedWorkflowBundle();
+      await installerFor(legacyAgent()).install(bundles: [kept, moved]);
+
+      await installerFor(migratedAgent()).install(bundles: [moved]);
+
+      final legacy = SkillManifest.load(legacyDir);
+      expect(legacy.skillNames, [kept.name]);
+      for (final path in legacy.entryFor(kept.name)!.paths) {
+        expect(
+          File(p.join(legacyDir, path.path)).existsSync(),
+          isTrue,
+          reason: path.path,
+        );
+      }
+      expect(
+        Directory(p.join(legacyDir, 'somnio_rules', moved.planSubDir))
+            .existsSync(),
+        isFalse,
+      );
+    });
+
+    test('moves workflow skills out of global_workflows', () {
+      _writeFile(
+        repoRoot,
+        'skills/git-commit-format/SKILL.md',
+        '---\ndescription: Writes commits.\n---\n\n# Commit\n',
+      );
+      const skill = WorkflowSkill(
+        id: 'git_commit_format',
+        name: 'git-commit-format',
+        displayName: 'Git Commit Format',
+        description: 'Writes commits.',
+        planRelativePath: 'skills/git-commit-format/SKILL.md',
+      );
+      installerFor(legacyAgent()).installWorkflowSkills([skill]);
+      final workflow = p.join(
+        legacyDir,
+        'global_workflows',
+        'somnio_git_commit_format.md',
+      );
+      expect(File(workflow).existsSync(), isTrue);
+
+      installerFor(migratedAgent()).installWorkflowSkills([skill]);
+
+      expect(File(workflow).existsSync(), isFalse);
+      expect(
+        File(p.join(installDir, 'git-commit-format', 'SKILL.md'))
+            .readAsStringSync(),
+        startsWith('---\nname: git-commit-format\n'),
+      );
+      expect(SkillManifest.load(legacyDir).isEmpty, isTrue);
+    });
+
+    test('leaves legacy workflows no manifest records untouched', () async {
+      final bundle = seedWorkflowBundle();
+      _writeFile(
+        legacyDir,
+        'global_workflows/somnio_flutter_health.md',
+        'PRE-MANIFEST',
+      );
+
+      await installerFor(migratedAgent()).install(bundles: [bundle]);
+
+      expect(
+        File(p.join(legacyDir, 'global_workflows', 'somnio_flutter_health.md'))
+            .readAsStringSync(),
+        'PRE-MANIFEST',
+      );
+    });
+
+    test('never deletes through a symlinked legacy directory', () async {
+      final bundle = seedWorkflowBundle();
+      final outside = Directory(p.join(tmp.path, 'outside'))..createSync();
+      _writeFile(outside.path, 'keep.md', 'THEIRS');
+      Directory(legacyDir).createSync(recursive: true);
+      Link(p.join(legacyDir, 'global_workflows')).createSync(outside.path);
+      SkillManifest.load(legacyDir)
+        ..record(
+          skill: bundle.name,
+          kind: 'audit',
+          paths: const [
+            ManifestPath(ManifestRoot.install, 'global_workflows/keep.md'),
+          ],
+        )
+        ..save();
+
+      await installerFor(migratedAgent()).install(bundles: [bundle]);
+
+      expect(File(p.join(outside.path, 'keep.md')).existsSync(), isTrue);
+    });
+
+    test('does not migrate when the manifest is not recorded', () async {
+      final bundle = seedWorkflowBundle();
+      await installerFor(legacyAgent()).install(bundles: [bundle]);
+
+      await AgentInstaller(
+        logger: logger,
+        loader: loader,
+        agentConfig: migratedAgent(),
+        environment: const {},
+        recordManifest: false,
+      ).install(bundles: [bundle]);
+
+      expect(SkillManifest.load(legacyDir).skillNames, [bundle.name]);
+      expect(
+        File(p.join(legacyDir, 'global_workflows', 'somnio_flutter_health.md'))
+            .existsSync(),
+        isTrue,
+      );
     });
   });
 }

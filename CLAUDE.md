@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | Path | What lives here |
 |------|-----------------|
 | `cli/` | The Somnio CLI — a Dart 3 package (`pubspec.yaml`, `bin/somnio.dart`). The only real codebase. |
-| `skills/` | Markdown skill bundles (one dir each: `SKILL.md` + `references/` + `assets/`). Distributed via skills.sh. |
+| `skills/` | Markdown skill bundles (one dir each: `SKILL.md` + `references/` + `assets/`). Distributed via the Somnio CLI. |
 | `agent-rules/` | Canonical coding-standard rules (`rules/<stack>/*.md`) + generated per-agent adapters (`adapters/`). |
 | `commands/`, `hooks/` | Claude Code slash-command markdown and shell hooks (e.g. `hooks/work-log-stop.sh`). |
 | `plugins/`, `.claude-plugin/` | Claude Desktop App (Cowork) plugin packages + `marketplace.json`. |
@@ -71,7 +71,7 @@ Each `SKILL.md` starts with YAML frontmatter (`name`, `description`, `allowed-to
 
 ## Conventions
 
-- **Commits:** Conventional Commits. **Branches:** `{type}/{TICKET}_{description}`. (Dedicated `git-commit-format` / `git-branch-format` skills exist for these.)
+- **Commits:** Conventional Commits. **Branches:** `{type}/{TICKET}_{description}`. **PRs:** Conventional Commits title, no AI attribution. (Dedicated `git-commit-format` / `git-branch-format` / `git-pr-format` skills exist for these.)
 - Markdown skills should not invent data — audits are explicitly evidence-based; the same applies when authoring skill instructions.
 
 <!-- BEGIN SOMNIO RULES — do not edit this block manually -->

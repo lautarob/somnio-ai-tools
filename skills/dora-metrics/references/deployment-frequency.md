@@ -10,10 +10,11 @@ How often a project deploys to production.
 **A Release (or, where unavailable, a plain tag) with semver format
 `vX.Y.Z`**, created on each repo's production branch (`main`). The
 Release/tag timestamp = the moment of the deploy. A single convention across
-the three project types (mobile/web/backend) and across the three supported
-providers (GitHub, GitLab, Bitbucket) — each repo declares its own `provider`
-and `deploy_source` in `config/projects.json`; Bitbucket Cloud has no
-Releases API, so its repos always use a plain tag (`deploy_source: "tag"`).
+the three project types (mobile/web/backend) and across the four supported
+providers (GitHub, GitLab, Bitbucket, Azure DevOps) — each repo declares its
+own `provider` and `deploy_source` in `config/projects.json`; Bitbucket Cloud
+and Azure DevOps have no Releases API, so their repos use a plain tag
+(`deploy_source: "tag"`) or the merge marker below.
 
 ### `deploy_source: "merge"`
 

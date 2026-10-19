@@ -1,3 +1,4 @@
+import 'package:somnio/src/agents/agent_config.dart';
 import 'package:somnio/src/agents/agent_registry.dart';
 import 'package:somnio/src/agents/installed_skill_names.dart';
 import 'package:somnio/src/content/skill_registry.dart';
@@ -6,8 +7,17 @@ import 'package:test/test.dart';
 void main() {
   final claude = AgentRegistry.findById('claude')!; // skillDir
   final cursor = AgentRegistry.findById('cursor')!; // singleFile
-  final gemini = AgentRegistry.findById('gemini')!; // markdown
-  final antigravity = AgentRegistry.findById('antigravity')!; // workflow
+  final copilot = AgentRegistry.findById('copilot')!; // markdown
+  final codex = AgentRegistry.findById('codex')!; // skillDir, legacy markdown
+  // skillDir, legacy workflow
+  final antigravity = AgentRegistry.findById('antigravity')!;
+  const workflowAgent = AgentConfig(
+    id: 'workflow-agent',
+    displayName: 'Workflow Agent',
+    installFormat: InstallFormat.workflow,
+    installPath: '/tmp/workflow-agent',
+    filePrefix: 'somnio_',
+  );
 
   group('InstalledSkillNames.all', () {
     test('covers every registered skill and workflow skill', () {
@@ -41,45 +51,67 @@ void main() {
 
     test('markdown underscores the bundle name', () {
       expect(
-        InstalledSkillNames.basenamesFor(gemini),
+        InstalledSkillNames.basenamesFor(copilot),
         contains('flutter_health_audit.md'),
       );
     });
 
+    test('also covers the legacy install format', () {
+      expect(
+        InstalledSkillNames.basenamesFor(codex),
+        containsAll(['flutter-health-audit', 'flutter_health_audit.md']),
+      );
+      expect(
+        InstalledSkillNames.basenamesFor(claude),
+        isNot(contains('flutter_health_audit.md')),
+      );
+    });
+
     test('workflow is matched by prefix, not by name', () {
-      expect(InstalledSkillNames.basenamesFor(antigravity), isEmpty);
+      expect(InstalledSkillNames.basenamesFor(workflowAgent), isEmpty);
+      expect(
+        InstalledSkillNames.matches(workflowAgent, 'somnio_flutter_ha.md'),
+        isTrue,
+      );
+    });
+
+    test('a legacy workflow layout adds no names to the skill directories', () {
+      expect(
+        InstalledSkillNames.basenamesFor(antigravity),
+        InstalledSkillNames.basenamesFor(claude),
+      );
     });
   });
 
   group('InstalledSkillNames.matches', () {
     test('matches the names the transformers really write', () {
       // These are unprefixed, so the old filePrefix check missed them.
-      expect(InstalledSkillNames.matches(claude, 'flutter-health-audit'),
-          isTrue);
+      expect(
+          InstalledSkillNames.matches(claude, 'flutter-health-audit'), isTrue);
       expect(InstalledSkillNames.matches(cursor, 'security-audit.md'), isTrue);
-      expect(InstalledSkillNames.matches(gemini, 'flutter_health_audit.md'),
+      expect(InstalledSkillNames.matches(copilot, 'flutter_health_audit.md'),
           isTrue);
       expect(InstalledSkillNames.matches(antigravity, 'somnio_flutter_ha.md'),
           isTrue);
     });
 
     test('matches skills added to the registry after the v1.x rename', () {
-      expect(InstalledSkillNames.matches(claude, 'python-health-audit'),
-          isTrue);
-      expect(InstalledSkillNames.matches(gemini, 'python_best_practices.md'),
+      expect(
+          InstalledSkillNames.matches(claude, 'python-health-audit'), isTrue);
+      expect(InstalledSkillNames.matches(copilot, 'python_best_practices.md'),
           isTrue);
     });
 
     test('still matches legacy prefixed installs', () {
       expect(InstalledSkillNames.matches(claude, 'somnio-fh'), isTrue);
-      expect(InstalledSkillNames.matches(gemini, 'somnio_fh.md'), isTrue);
+      expect(InstalledSkillNames.matches(copilot, 'somnio_fh.md'), isTrue);
     });
 
     test('does not match unrelated user content', () {
       expect(InstalledSkillNames.matches(claude, 'my-own-skill'), isFalse);
-      expect(InstalledSkillNames.matches(gemini, 'notes.md'), isFalse);
-      expect(InstalledSkillNames.matches(cursor, 'flutter-health-audit'),
-          isFalse);
+      expect(InstalledSkillNames.matches(copilot, 'notes.md'), isFalse);
+      expect(
+          InstalledSkillNames.matches(cursor, 'flutter-health-audit'), isFalse);
     });
   });
 }

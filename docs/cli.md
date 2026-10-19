@@ -29,16 +29,16 @@ somnio -q status      # Quiet mode (suppress banner)
 |---------|-------------|
 | `somnio setup` | Detect AI CLIs, install missing ones, install skills to every detected agent |
 | `somnio hooks` | Install Claude Code hooks (e.g. the work-log Stop hook) |
+| `somnio attribution` | Turn Claude Code's AI attribution on commits and PRs off or on |
 | `somnio run <name-or-alias>` | Execute a multi-step audit from the target project directory |
 | `somnio install` | Install skills to a specific agent or all agents |
 | `somnio skills` | Install, update, or remove skills — globally or per project |
 | `somnio add <tech>` | Add a new technology's audit skills (scaffolds + registers) |
-| `somnio status` | Show installed skills across all agents |
+| `somnio status` | Show the CLI version and installed skills across all agents, with each skill's template stamp |
 | `somnio update` | Update the CLI binary only (skills are managed by `somnio skills`) |
 | `somnio uninstall` | Remove the CLI, optionally with the installed skills |
 | `somnio rules` | Install coding-standard rules for all detected agents |
 | `somnio workflow` | Create, configure, and run custom workflows |
-| `somnio quote` | Display a random motivational quote |
 
 ### somnio hooks
 
@@ -55,6 +55,8 @@ What it does:
 2. Makes the script executable
 3. Merges the Stop hook entry into `~/.claude/settings.json` without overwriting existing config
 
+With `CLAUDE_CONFIG_DIR` set, the script and the settings entry go under that directory instead of `~/.claude`, and the entry points at the script's absolute path.
+
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--force` | `-f` | Skip the confirmation prompt |
@@ -65,6 +67,25 @@ What it does:
 2. Edit `~/.claude/settings.json` and remove the entry with `"command": "~/.claude/hooks/work-log-stop.sh"` from `hooks.Stop`
 
 > **Note:** `somnio hooks` is intentionally separate from `somnio setup` — hooks modify your Claude Code session behaviour and should be an explicit opt-in. See [docs/work-log-stop-hook.md](work-log-stop-hook.md) for the full hook design.
+
+### somnio attribution
+
+Turns off the AI attribution Claude Code adds by default: the `Co-Authored-By: Claude …` trailer on commits and the "🤖 Generated with [Claude Code](https://claude.com/claude-code)" footer on pull request descriptions.
+
+```bash
+somnio attribution off      # set "attribution": {"commit": "", "pr": ""}
+somnio attribution on       # remove the "attribution" key (Claude Code's default)
+somnio attribution status   # on (default), off, or customized
+```
+
+What it does:
+1. Reads `~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json` when that is set (creates it if absent)
+2. Sets or removes only the `attribution` key, keeping every other setting
+3. Is idempotent: running `off` twice leaves the file as it is
+
+If `settings.json` is not valid JSON, the command stops with an error and does not touch the file.
+
+It applies to every Claude Code session on the machine, in every repository. Other agents have no such setting; the [`git-commit-format`](skills.md#git-commit-format) and [`git-pr-format`](skills.md#git-pr-format) skills keep attribution out of their commits and pull requests.
 
 ### somnio setup
 
@@ -85,6 +106,8 @@ somnio setup --force      # Skip all prompts, including the skills.sh cleanup
 
 > `--legacy` is deprecated since 3.2.0: it is hidden, has no effect and prints a warning, because the built-in installer is now the only one.
 
+When Claude Code is one of the detected agents and its attribution is not already off, setup then asks whether to turn it off (see [somnio attribution](#somnio-attribution)). `--force` and non-interactive runs never change it: they print the `somnio attribution off` command instead.
+
 Setup detects agents and resolves the skill content first; the skills.sh cleanup only runs once it knows the install can go ahead, so a machine with no agents (or a content error) keeps its skills.sh copies.
 
 ### somnio run
@@ -99,6 +122,7 @@ somnio run fh --skip-validation        # Skip project type check
 somnio run fh --no-preflight           # Send all steps to AI
 somnio run fh --step-timeout 45        # Per-step timeout of 45 minutes
 somnio run fh --project-name hoopis    # Override the name in the report file
+somnio run fh --upload                 # Upload the report to the project's Drive folder
 ```
 
 | Flag | Short | Description |
@@ -109,6 +133,20 @@ somnio run fh --project-name hoopis    # Override the name in the report file
 | `--no-preflight` | | Skip pre-flight and send all steps to AI |
 | `--step-timeout` | | Per-step timeout in minutes (default: 30) |
 | `--project-name` | | Project name used in the report file name (default: the git repository name) |
+| `--upload` | | Upload the report to the project's Google Drive folder through the Google Drive MCP (Claude Code only). See [Uploading reports to Drive](#uploading-reports-to-drive) |
+| `--drive-folder` | | Drive folder link or ID for `--upload`; saved for the project, so it is only needed once |
+
+#### Installed-skills version check
+
+Before pre-flight and before any step runs, `somnio run` reads the `Generated by` row of the installed report template and compares it with the CLI version. A report is never produced from skill files that differ from the running CLI, so a stale install is refused instead of producing an off-format report:
+
+| Installed stamp | Result |
+|-----------------|--------|
+| Equal to the CLI version | The run continues |
+| Different | Aborts: ``Installed <skill> skills are v<installed> but the CLI is v<cli>. Run `somnio skills update` and retry.`` |
+| Missing, placeholder or unreadable | Aborts: ``Installed <skill> skills have no version stamp (unknown install). Run `somnio skills update` and retry.`` |
+
+When the template file itself is missing, the unknown-install message is followed by a `Template not found: <path>` line naming the path that was checked. There is no flag to bypass the check.
 
 #### Report file name
 
@@ -138,10 +176,61 @@ reports/2026-09-14-hoopis-backend-security-audit.md
 
 Because the name carries the date, re-running an audit on a later day leaves the
 earlier report in place instead of overwriting it. Two runs on the same day do
-overwrite each other. `harness-audit`, `security-audit`, `soc2-audit` and
-`iso27001-audit` also write a `.json` export with the same base name;
-`reports/.history/last_scores.json` is trend state, not a report, and keeps its
-fixed name.
+overwrite each other. `harness-audit`, `soc2-audit` and `iso27001-audit` also write a `.json` export
+with the same base name (`security-audit` writes Markdown only);
+`reports/.history/last_<skill>_scores.json` (for example `last_security_scores.json`) is trend state, not a report, and keeps its
+fixed name. Each audit reads only its own file; the legacy shared `last_scores.json` is ignored,
+so the first run after upgrading reports "first run".
+
+### Uploading reports to Drive
+
+Every audit can upload its report to the project's shared Google Drive folder through the **Google Drive MCP**, following the [sharing rules](#sharing-reports). It only happens when you ask for it:
+
+```bash
+somnio run fh --upload                                                # folder saved, or asked once
+somnio run sa --upload --drive-folder https://drive.google.com/drive/folders/<folder_id>
+```
+
+In a Claude Code session, ask for it the same way: `/flutter-health-audit upload`, or "run the security audit and upload it to Drive".
+
+**Requirements:** Claude Code with the Google Drive connector connected (in Claude: Settings → Connectors → Google Drive). `--upload` with another agent stops before running the audit.
+
+**How `somnio run --upload` works:**
+1. Before any step runs, it resolves the project's folder: `--drive-folder` (saved for next time), the folder saved in `~/.somnio-reports-prefs.json` (`SOMNIO_REPORTS_PREFS_PATH` overrides the path), or a prompt in an interactive terminal. With none of those it stops, so a missing folder never costs a full audit.
+2. After the report and format enforcement, one more AI step follows the skill's `references/drive-upload.md` in CLI mode. It is the only step allowed to call the Drive MCP tools. It uploads the `.md` with conversion to Google Docs disabled and writes its result to `reports/.artifacts/<skill>/drive_upload.json`.
+3. The CLI then checks the result against the local report itself: name, `text/markdown` type, folder and exact byte size. A mismatch is reported with the folder link, so you can fix it by hand.
+4. If the folder already has a file with that name (a second run the same day), it asks whether to replace it; non-interactive runs skip it.
+
+A failed upload does not undo the audit, but `somnio run` exits with a non-zero code. The prefs file looks like this, keyed by the project slug in the report file name:
+
+```json
+{
+  "report_folders": {
+    "hoopis-backend": {
+      "folder_id": "<folder_id>",
+      "folder_url": "https://drive.google.com/drive/folders/<folder_id>"
+    }
+  }
+}
+```
+
+The upload instructions are shared by every audit skill: the source is `shared/references/drive-upload.md`, copied into each skill's `references/`, and a test fails when a copy drifts.
+
+### Sharing reports
+
+Reports feed an internal pipeline that parses them, so share them exactly as the CLI wrote them:
+
+- Upload the `.md` exactly as written, and keep the file name (`YYYY-MM-DD-<repo>-<skill-name>.md`).
+- One file per repo and per report type, flat, in the shared reports folder your EM gives you (one folder per project). No dated subfolders.
+- `somnio run <audit> --upload` (or asking for the upload in session) uploads them this way; see [Uploading reports to Drive](#uploading-reports-to-drive).
+- Do not convert the report to Google Docs or any other format.
+- Never edit the Report Metadata block at the end of the report.
+- Reports from CLI versions before 2.12.0 (`<tech>_audit.md`, `<date>_dora.md`) must be regenerated, not renamed.
+- Generate them with `somnio run`, or with an install kept current by `somnio skills update`. For DORA, pass `--out-dir reports` and share each saved per-repo file; never merge several repos into one file.
+
+### somnio status
+
+Prints the CLI version (`Somnio CLI vX.Y.Z`), which AI CLIs are available, and the installed skills per agent. The `Stamp` column shows the version stamped in each installed report template. A stamp that differs from the CLI is shown as `v<installed> (mismatch, CLI v<cli>)`, and a missing or placeholder stamp, or a missing template next to installed rules, as `unknown`; run `somnio skills update` to fix either.
 
 ### somnio install
 
@@ -213,11 +302,22 @@ somnio skills update --dry-run --verbose   # show the cleanup plan and what woul
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--agent` | `-a` | Limit the refresh to a single agent |
-| `--verbose` | `-v` | Show the install directory for each refreshed location and every skills.sh link path in the cleanup plan |
+| `--verbose` | `-v` | Show the install directory and the updated skill names under each refreshed location, and every skills.sh link path in the cleanup plan |
 | `--yes` | `-y` | Remove Somnio skills installed by skills.sh without asking |
 | `--dry-run` | | Print the skills.sh cleanup plan and what would be refreshed (agent, scope, location, skill names), then exit without removing or refreshing anything |
 
 When run from the home directory, the project scope is the global folder; that location is refreshed once, as global.
+
+Each location still prints its own progress line (`✓ Claude Code (global)  25 skills updated`). After all locations are processed, `update` prints the skills it refreshed, covering both audit and workflow skills:
+
+```
+Updated skills (25):
+  - flutter-health-audit
+  - security-audit
+  ...
+```
+
+`N` counts the unique skill names refreshed in at least one location; names are sorted alphabetically. If any skill failed, a `Failed skills:` block follows with one `  - <skill> — <Agent> (<scope>)` line per failure, and the command exits non-zero. Nothing is printed when no skills were refreshed (including `No somnio-installed skills found.`), and `--dry-run` keeps printing its plan only.
 
 `update` only reinstalls what the discovered manifests cover. Any skills.sh skill outside them is listed as **"will be removed and NOT reinstalled"** (also with `--yes` and in `--dry-run`), and the cleanup prompt then defaults to *no*. Run `somnio skills install` afterwards to get those back.
 
@@ -243,9 +343,11 @@ somnio skills remove --agent claude --project
 
 > Running non-interactively requires an explicit `--global` or `--project` — the command clears an entire scope, so it will not guess.
 
+Only skills recorded in a location's `.somnio-skills.json` manifest are removed from it. When the global scope is cleared for all agents (no `--agent`), the Somnio skills installed by skills.sh are removed too, through the same [cleanup](#cleanup-of-skillssh-installs) as the install commands: they are listed with the rest and covered by the same confirmation (`--verbose` lists every link path). Their canonical copies are shared by every agent and never live in a project, so `--agent` and `--project` leave them in place and say how many were kept. It does not remove agent rules or the CLI — that is `somnio uninstall --skills`.
+
 ### Cleanup of skills.sh installs
 
-The CLI does not use skills.sh (`npx skills add`). Somnio skills that skills.sh installed globally are not recorded in the `.somnio-skills.json` manifest, so `somnio skills update` could never refresh them: they go stale next to the Somnio-managed copies. `somnio setup`, `somnio install`, `somnio skills install` and `somnio skills update` therefore remove them once, after they know the install can go ahead and before installing anything (`somnio uninstall --skills` removes them too):
+Somnio skills that a legacy skills.sh install left globally are not recorded in the `.somnio-skills.json` manifest, so `somnio skills update` could never refresh them: they go stale next to the Somnio-managed copies. `somnio setup`, `somnio install`, `somnio skills install` and `somnio skills update` therefore remove them once, after they know the install can go ahead and before installing anything (`somnio uninstall --skills` and `somnio skills remove --global` remove them too):
 
 1. Reads the skills.sh global lock — `$XDG_STATE_HOME/skills/.skill-lock.json` if `XDG_STATE_HOME` is set, otherwise `~/.agents/.skill-lock.json`. A missing lock means there is nothing to do; an unreadable or unrecognised lock is reported and **nothing is touched**.
 2. Picks every lock entry whose source is `somnio-software/somnio-ai-tools` — including skills that are no longer shipped. Third-party skills are never touched.
@@ -384,10 +486,14 @@ A summary is printed at the end with total tokens, cost, and time breakdown.
 Somnio uses a data-driven agent registry. Adding a new agent requires a single `AgentConfig` entry.
 
 **CLI agents** (can execute audits via `somnio run`):
-Claude Code, Cursor, Gemini CLI, Antigravity, Codex, Augment Code, Amp, Aider, Cline, OpenCode, CodeBuddy, Qwen CLI
+Claude Code, Cursor, Gemini CLI, Codex, Augment Code, Amp, Aider, Cline, OpenCode, CodeBuddy, Qwen CLI
 
 **IDE-only agents** (receive skill files via `somnio setup`):
-GitHub Copilot, Windsurf, Roo Code, Kilo Code, Amazon Q
+Antigravity, GitHub Copilot, Windsurf, Roo Code, Kilo Code, Amazon Q
+
+Agents that load skills as `<name>/SKILL.md` directories get one per skill, with its `references/`, `assets/` and `agents/` next to it: Claude Code (`$CLAUDE_CONFIG_DIR/skills`, default `~/.claude/skills`), Codex (`$CODEX_HOME/skills`, default `~/.codex/skills`), Gemini CLI (`~/.gemini/skills`), Antigravity (`~/.gemini/config/skills`), Augment Code (`~/.augment/skills`), OpenCode (`~/.opencode/skills`), Cline (`~/.cline/skills`), CodeBuddy (`~/.codebuddy/skills`) and Qwen CLI (`~/.qwen/skills`). Releases before 3.2.12 wrote flat `<name>.md` files plus a `somnio_rules/` directory for all of them except Claude Code, which those agents never load. `somnio skills update` replaces that layout: it deletes the old files and rule directories the manifest recorded, then the emptied `somnio_rules/`. `somnio skills remove` deletes what the manifest records in either layout, and `somnio uninstall --skills` also removes unrecorded flat files and `somnio_rules/`. Run `somnio skills update` once after upgrading so `somnio run` finds the references in the skill directories.
+
+Antigravity IDE workflows stop working on 2026-10-19, so Antigravity now gets skills too, in its global skills folder `~/.gemini/config/skills`. Releases before 3.2.15 installed workflows into `~/.gemini/antigravity/global_workflows/` (`somnio_<name>.md`) plus their references under `~/.gemini/antigravity/somnio_rules/`. `somnio skills update` finds what the manifest in `~/.gemini/antigravity` records, installs those skills into `~/.gemini/config/skills`, deletes the recorded workflow and rule files, and removes `somnio_rules/` once nothing is left in it; `skills install` and `setup` do the same for every skill they reinstall. Other workflows in `global_workflows/` are never touched. `somnio skills remove` deletes what either manifest records, and `somnio uninstall --skills` also removes unrecorded `somnio_`-prefixed workflows and `somnio_rules/`. Workflows installed before the manifest existed are only removed by `uninstall --skills`; delete them by hand otherwise.
 
 ---
 

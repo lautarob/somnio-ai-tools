@@ -8,6 +8,9 @@
 // doc's header), so nothing else in `dart analyze`/`dart test` would ever
 // catch a hand-edit that quietly breaks the contract. This file is that
 // safety net.
+//
+// The security-audit template (`skills/security-audit/assets/report-template.md`)
+// has its own, smaller contract, checked in the last group of `main`.
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -37,16 +40,35 @@ const _canonicalTail = [
 
 /// The scorecard's scoring-legend blockquote, byte-identical across all seven
 /// — including the en dash (U+2013) and middle dot (U+00B7).
-const _scoringLegend =
-    '> **Scoring:** Strong (85–100) · Fair (70–84) · '
+const _scoringLegend = '> **Scoring:** Strong (85–100) · Fair (70–84) · '
     'Weak (0–69)';
 
 /// Weight family A (flutter, python, nestjs, dotnet) — the exact multiset of
 /// per-section weights, order-independent.
-const _groupAWeights = <double>[0.18, 0.18, 0.18, 0.10, 0.10, 0.10, 0.03, 0.03, 0.10];
+const _groupAWeights = <double>[
+  0.18,
+  0.18,
+  0.18,
+  0.10,
+  0.10,
+  0.10,
+  0.03,
+  0.03,
+  0.10
+];
 
 /// Weight family B (react, angular, angularjs).
-const _groupBWeights = <double>[0.18, 0.18, 0.135, 0.135, 0.135, 0.075, 0.03, 0.03, 0.10];
+const _groupBWeights = <double>[
+  0.18,
+  0.18,
+  0.135,
+  0.135,
+  0.135,
+  0.075,
+  0.03,
+  0.03,
+  0.10
+];
 
 /// Walks up from the test's working directory until it finds the repo root
 /// (the directory that contains the top-level `skills/` folder). Mirrors the
@@ -119,11 +141,16 @@ Map<String, double> _parseWeightRows(List<String> sectionLines) {
   final weights = <String, double>{};
   for (final line in sectionLines) {
     if (!line.trimLeft().startsWith('|')) continue;
-    final cells = line.split('|').map((c) => c.trim()).where((c) => c.isNotEmpty).toList();
+    final cells = line
+        .split('|')
+        .map((c) => c.trim())
+        .where((c) => c.isNotEmpty)
+        .toList();
     if (cells.length != 2) continue;
     final label = cells[0].replaceAll('*', '').trim();
     final value = double.tryParse(cells[1].replaceAll('*', '').trim());
-    if (value == null) continue; // header row ("Section"/"Weight") or the '---' separator
+    if (value == null)
+      continue; // header row ("Section"/"Weight") or the '---' separator
     if (label == 'Total') continue;
     weights[label] = value;
   }
@@ -131,13 +158,20 @@ Map<String, double> _parseWeightRows(List<String> sectionLines) {
 }
 
 void main() {
-  final content = {for (final s in _allStacks) s: File(_templatePath(s)).readAsStringSync()};
+  final content = {
+    for (final s in _allStacks) s: File(_templatePath(s)).readAsStringSync()
+  };
   final lines = {for (final s in _allStacks) s: content[s]!.split('\n')};
-  final headings = {for (final s in _allStacks) s: _numberedHeadings(lines[s]!)};
+  final headings = {
+    for (final s in _allStacks) s: _numberedHeadings(lines[s]!)
+  };
 
-  group('report-template.md drift check (canonical contract, docs/report-template-canonical.md)',
+  group(
+      'report-template.md drift check (canonical contract, docs/report-template-canonical.md)',
       () {
-    group('invariant 1: exactly 15 numbered sections, 1..15, no gaps or duplicates', () {
+    group(
+        'invariant 1: exactly 15 numbered sections, 1..15, no gaps or duplicates',
+        () {
       for (final stack in _allStacks) {
         test(stack, () {
           final numbers = headings[stack]!.map((h) => h.number).toList();
@@ -152,35 +186,45 @@ void main() {
       }
     });
 
-    group('invariant 2: canonical section-name sequence (with only the documented '
+    group(
+        'invariant 2: canonical section-name sequence (with only the documented '
         'stack-variable slots)', () {
       for (final stack in _allStacks) {
         test(stack, () {
           final titles = headings[stack]!.map((h) => h.title).toList();
-          expect(titles.length, 15, reason: '${_skillLabel(stack)}: expected 15 sections');
+          expect(titles.length, 15,
+              reason: '${_skillLabel(stack)}: expected 15 sections');
 
           expect(titles[0], 'Executive Summary',
               reason: '${_skillLabel(stack)}: section 1 diverged');
           expect(titles[1], 'At-a-Glance Scorecard',
               reason: '${_skillLabel(stack)}: section 2 diverged');
-          expect(titles[2], 'Tech Stack', reason: '${_skillLabel(stack)}: section 3 diverged');
-          expect(titles[3], 'Architecture', reason: '${_skillLabel(stack)}: section 4 diverged');
+          expect(titles[2], 'Tech Stack',
+              reason: '${_skillLabel(stack)}: section 3 diverged');
+          expect(titles[3], 'Architecture',
+              reason: '${_skillLabel(stack)}: section 4 diverged');
 
           final slotA = titles[4];
           const validSlotA = ['State Management', 'API Design'];
           expect(
             validSlotA.contains(slotA),
             isTrue,
-            reason: '${_skillLabel(stack)}: section 5 must be "State Management" or '
+            reason:
+                '${_skillLabel(stack)}: section 5 must be "State Management" or '
                 '"API Design", found "$slotA"',
           );
 
           final slot6 = titles[5];
-          const validSlot6 = ['Repositories & Data Layer', 'Data Layer', 'Testing'];
+          const validSlot6 = [
+            'Repositories & Data Layer',
+            'Data Layer',
+            'Testing'
+          ];
           expect(
             validSlot6.contains(slot6),
             isTrue,
-            reason: '${_skillLabel(stack)}: section 6 must be one of $validSlot6, '
+            reason:
+                '${_skillLabel(stack)}: section 6 must be one of $validSlot6, '
                 'found "$slot6"',
           );
 
@@ -208,7 +252,8 @@ void main() {
               reason: '${_skillLabel(stack)}: has slot-B section "$slot6" but '
                   '"$stack" is not in group $_groupA',
             );
-            expect(titles[6], 'Testing', reason: '${_skillLabel(stack)}: section 7 diverged');
+            expect(titles[6], 'Testing',
+                reason: '${_skillLabel(stack)}: section 7 diverged');
             expect(titles[7], 'Code Quality (Linter & Warnings)',
                 reason: '${_skillLabel(stack)}: section 8 diverged');
           }
@@ -223,7 +268,8 @@ void main() {
           expect(
             hasPerformance,
             expected,
-            reason: '${_skillLabel(stack)} ${hasPerformance ? "has" : "is missing"} a '
+            reason:
+                '${_skillLabel(stack)} ${hasPerformance ? "has" : "is missing"} a '
                 'Performance section; expected presence to be $expected '
                 '(Performance is only valid for $_groupB)',
           );
@@ -245,14 +291,16 @@ void main() {
       });
     });
 
-    group('invariant 3: unnumbered Appendix: Scoring Methodology + Report Metadata, '
+    group(
+        'invariant 3: unnumbered Appendix: Scoring Methodology + Report Metadata, '
         'after section 15', () {
       for (final stack in _allStacks) {
         test(stack, () {
           final c = content[stack]!;
           final section15 = headings[stack]!.last;
           expect(
-            section15.number == 15 && section15.title == 'Appendix: Evidence Index',
+            section15.number == 15 &&
+                section15.title == 'Appendix: Evidence Index',
             isTrue,
             reason: '${_skillLabel(stack)}: last numbered section must be '
                 '"## 15. Appendix: Evidence Index", found '
@@ -270,7 +318,8 @@ void main() {
           expect(
             metadataIdx,
             isNot(-1),
-            reason: '${_skillLabel(stack)}: missing unnumbered "## Report Metadata" heading',
+            reason:
+                '${_skillLabel(stack)}: missing unnumbered "## Report Metadata" heading',
           );
 
           final section15Idx = c.indexOf('## 15. ${section15.title}');
@@ -288,20 +337,24 @@ void main() {
           expect(
             numberedTitles.contains('Appendix: Scoring Methodology'),
             isFalse,
-            reason: '${_skillLabel(stack)}: "Appendix: Scoring Methodology" must stay '
+            reason:
+                '${_skillLabel(stack)}: "Appendix: Scoring Methodology" must stay '
                 'unnumbered (no "## N." prefix)',
           );
           expect(
             numberedTitles.contains('Report Metadata'),
             isFalse,
-            reason: '${_skillLabel(stack)}: "Report Metadata" must stay unnumbered '
+            reason:
+                '${_skillLabel(stack)}: "Report Metadata" must stay unnumbered '
                 '(no "## N." prefix)',
           );
         });
       }
     });
 
-    group('invariant 4: exactly one "> **Test Coverage:**" line, before section 3', () {
+    group(
+        'invariant 4: exactly one "> **Test Coverage:**" line, before section 3',
+        () {
       for (final stack in _allStacks) {
         test(stack, () {
           final c = content[stack]!;
@@ -310,7 +363,8 @@ void main() {
           expect(
             count,
             1,
-            reason: '${_skillLabel(stack)}: expected exactly one "$marker" line, '
+            reason:
+                '${_skillLabel(stack)}: expected exactly one "$marker" line, '
                 'found $count',
           );
 
@@ -320,14 +374,16 @@ void main() {
           expect(
             markerIdx < section3Idx,
             isTrue,
-            reason: '${_skillLabel(stack)}: "$marker" must appear before section 3 '
+            reason:
+                '${_skillLabel(stack)}: "$marker" must appear before section 3 '
                 '("${section3.title}"), but it appears after',
           );
         });
       }
     });
 
-    group('invariant 5: Testing section carries exactly one Code Coverage + one '
+    group(
+        'invariant 5: Testing section carries exactly one Code Coverage + one '
         'Coverage Breakdown field, between Score and Key Findings', () {
       for (final stack in _allStacks) {
         test(stack, () {
@@ -337,7 +393,8 @@ void main() {
           expect(
             codeCoverageCount,
             1,
-            reason: '${_skillLabel(stack)}: expected exactly one "**Code Coverage:**" '
+            reason:
+                '${_skillLabel(stack)}: expected exactly one "**Code Coverage:**" '
                 'field in the whole report, found $codeCoverageCount',
           );
           final breakdownCount = '**Coverage Breakdown:**'.allMatches(c).length;
@@ -351,10 +408,11 @@ void main() {
 
           final testing = headings[stack]!.firstWhere(
             (h) => h.title == 'Testing',
-            orElse: () =>
-                throw StateError('${_skillLabel(stack)}: no "Testing" section found'),
+            orElse: () => throw StateError(
+                '${_skillLabel(stack)}: no "Testing" section found'),
           );
-          final range = _sectionRange(lines[stack]!, '## ${testing.number}. Testing');
+          final range =
+              _sectionRange(lines[stack]!, '## ${testing.number}. Testing');
           final body = lines[stack]!.sublist(range.start, range.end).join('\n');
 
           final scoreIdx = body.indexOf('**Score:**');
@@ -363,13 +421,18 @@ void main() {
           final keyFindingsIdx = body.indexOf('### Key Findings');
 
           expect(
-            scoreIdx != -1 && codeCoverageIdx != -1 && breakdownIdx != -1 && keyFindingsIdx != -1,
+            scoreIdx != -1 &&
+                codeCoverageIdx != -1 &&
+                breakdownIdx != -1 &&
+                keyFindingsIdx != -1,
             isTrue,
             reason: '${_skillLabel(stack)}: Testing section is missing one of '
                 '**Score:**/**Code Coverage:**/**Coverage Breakdown:**/### Key Findings',
           );
           expect(
-            scoreIdx < codeCoverageIdx && codeCoverageIdx < breakdownIdx && breakdownIdx < keyFindingsIdx,
+            scoreIdx < codeCoverageIdx &&
+                codeCoverageIdx < breakdownIdx &&
+                breakdownIdx < keyFindingsIdx,
             isTrue,
             reason:
                 '${_skillLabel(stack)}: Testing section field order diverged. Expected '
@@ -381,22 +444,28 @@ void main() {
       }
     });
 
-    group('invariant 6: exactly one "### Harness Coverage", no bare "### Coverage"', () {
+    group(
+        'invariant 6: exactly one "### Harness Coverage", no bare "### Coverage"',
+        () {
       for (final stack in _allStacks) {
         test(stack, () {
           final fileLines = lines[stack]!;
-          final harnessCoverageCount = fileLines.where((l) => l == '### Harness Coverage').length;
+          final harnessCoverageCount =
+              fileLines.where((l) => l == '### Harness Coverage').length;
           expect(
             harnessCoverageCount,
             1,
-            reason: '${_skillLabel(stack)}: expected exactly one "### Harness Coverage" '
+            reason:
+                '${_skillLabel(stack)}: expected exactly one "### Harness Coverage" '
                 'heading, found $harnessCoverageCount',
           );
-          final bareCoverageCount = fileLines.where((l) => l == '### Coverage').length;
+          final bareCoverageCount =
+              fileLines.where((l) => l == '### Coverage').length;
           expect(
             bareCoverageCount,
             0,
-            reason: '${_skillLabel(stack)}: found a bare "### Coverage" heading — it '
+            reason:
+                '${_skillLabel(stack)}: found a bare "### Coverage" heading — it '
                 'must be "### Harness Coverage" (a bare "Coverage" heading collides '
                 'with the "Test Coverage" scorecard label)',
           );
@@ -404,7 +473,8 @@ void main() {
       }
     });
 
-    group('invariant 7: scoring-legend blockquote is byte-identical, en dash + middle dot',
+    group(
+        'invariant 7: scoring-legend blockquote is byte-identical, en dash + middle dot',
         () {
       for (final stack in _allStacks) {
         test(stack, () {
@@ -413,7 +483,8 @@ void main() {
           expect(
             matches,
             1,
-            reason: '${_skillLabel(stack)}: expected exactly one occurrence of the '
+            reason:
+                '${_skillLabel(stack)}: expected exactly one occurrence of the '
                 'canonical scoring-legend line (with U+2013 en dash and U+00B7 '
                 'middle dot):\n  $_scoringLegend\nbut found $matches. Check for '
                 'plain ASCII hyphens/dots or reworded text.',
@@ -429,7 +500,8 @@ void main() {
           expect(
             c.contains('Quality Index'),
             isFalse,
-            reason: '${_skillLabel(stack)}: found "Quality Index" — that section was '
+            reason:
+                '${_skillLabel(stack)}: found "Quality Index" — that section was '
                 'removed as a byte-for-byte duplicate of the At-a-Glance Scorecard '
                 '(see docs/report-template-canonical.md)',
           );
@@ -441,12 +513,14 @@ void main() {
       for (final stack in _allStacks) {
         test(stack, () {
           final scorecard = headings[stack]!.firstWhere((h) => h.number == 2);
-          final range = _sectionRange(lines[stack]!, '## 2. ${scorecard.title}');
+          final range =
+              _sectionRange(lines[stack]!, '## 2. ${scorecard.title}');
           final body = lines[stack]!.sublist(range.start, range.end).join('\n');
           expect(
             body.contains('Weight'),
             isFalse,
-            reason: '${_skillLabel(stack)}: the At-a-Glance Scorecard table must not '
+            reason:
+                '${_skillLabel(stack)}: the At-a-Glance Scorecard table must not '
                 'carry a Weight column — weights live only in the Appendix: '
                 'Scoring Methodology',
           );
@@ -454,13 +528,16 @@ void main() {
       }
     });
 
-    group('invariant 10: Scoring Methodology weight rows parse, sum to 1.00, and '
+    group(
+        'invariant 10: Scoring Methodology weight rows parse, sum to 1.00, and '
         'match the correct weight family', () {
       for (final stack in _allStacks) {
         test(stack, () {
           final fileLines = lines[stack]!;
-          final range = _sectionRange(fileLines, '## Appendix: Scoring Methodology');
-          final weights = _parseWeightRows(fileLines.sublist(range.start, range.end));
+          final range =
+              _sectionRange(fileLines, '## Appendix: Scoring Methodology');
+          final weights =
+              _parseWeightRows(fileLines.sublist(range.start, range.end));
 
           expect(
             weights.isNotEmpty,
@@ -478,14 +555,16 @@ void main() {
           );
 
           final actualSorted = weights.values.toList()..sort();
-          final expected = _groupA.contains(stack) ? _groupAWeights : _groupBWeights;
+          final expected =
+              _groupA.contains(stack) ? _groupAWeights : _groupBWeights;
           final expectedGroupName = _groupA.contains(stack) ? 'A' : 'B';
           final expectedSorted = List<double>.from(expected)..sort();
 
           expect(
             actualSorted.length,
             expectedSorted.length,
-            reason: '${_skillLabel(stack)}: expected ${expectedSorted.length} weight '
+            reason:
+                '${_skillLabel(stack)}: expected ${expectedSorted.length} weight '
                 'rows for weight family $expectedGroupName, found '
                 '${actualSorted.length}. Rows: $weights',
           );
@@ -493,7 +572,8 @@ void main() {
             expect(
               actualSorted[i],
               closeTo(expectedSorted[i], 0.0001),
-              reason: '${_skillLabel(stack)}: weight set diverged from weight family '
+              reason:
+                  '${_skillLabel(stack)}: weight set diverged from weight family '
                   '$expectedGroupName ($stack is in '
                   '${_groupA.contains(stack) ? _groupA : _groupB}).\n'
                   '  expected weights (sorted): $expectedSorted\n'
@@ -505,7 +585,8 @@ void main() {
       }
     });
 
-    group('invariant 11: header carries **Project:** metadata block and '
+    group(
+        'invariant 11: header carries **Project:** metadata block and '
         '> **Exclusions:** blockquote', () {
       for (final stack in _allStacks) {
         test(stack, () {
@@ -514,7 +595,8 @@ void main() {
           expect(
             firstHeadingIdx,
             isNot(-1),
-            reason: '${_skillLabel(stack)}: could not find "## 1. " to bound the header',
+            reason:
+                '${_skillLabel(stack)}: could not find "## 1. " to bound the header',
           );
           final header = c.substring(0, firstHeadingIdx);
           expect(
@@ -531,6 +613,78 @@ void main() {
           );
         });
       }
+    });
+  });
+
+  group('security-audit report-template.md drift check', () {
+    final path = p.join(_repoRoot(), 'skills', 'security-audit', 'assets',
+        'report-template.md');
+    final secLines = File(path).readAsStringSync().split('\n');
+    const label = 'security-audit report-template.md';
+    const areaNames = {
+      'Sensitive File Protection',
+      'Secret Detection',
+      'Dependency Security',
+      'Supply Chain Integrity',
+      'Security Automation & CI/CD',
+    };
+
+    test('has 12 numbered sections: 1, 2, one 3-7 placeholder, 8..12', () {
+      final numbers = _numberedHeadings(secLines).map((h) => h.number).toList();
+      expect(numbers, [1, 2, 8, 9, 10, 11, 12],
+          reason: '$label: numbered headings other than the single '
+              '"## [N]. [Section Name]" placeholder for sections 3-7');
+      final placeholders =
+          secLines.where((l) => l == '## [N]. [Section Name]').length;
+      expect(placeholders, 1,
+          reason: '$label: expected one "## [N]. [Section Name]" placeholder');
+    });
+
+    test('sections 3-7 are exactly the five area names', () {
+      final noteLine = secLines.firstWhere((l) => l.startsWith('> _(One of:'),
+          orElse: () => '');
+      expect(noteLine, isNotEmpty,
+          reason: '$label: missing the "> _(One of: ...)_" area-name note');
+      final names = noteLine
+          .replaceFirst('> _(One of:', '')
+          .replaceFirst(')_', '')
+          .split('·')
+          .map((n) => n.trim())
+          .toSet();
+      expect(names, areaNames, reason: '$label: area names diverged');
+    });
+
+    test('## 1. header row is exactly "| Area | Score |"', () {
+      final start = secLines.indexOf('## 1. Security Scoring Breakdown');
+      expect(start, isNot(-1), reason: '$label: missing "## 1." heading');
+      final header = secLines
+          .skip(start + 1)
+          .firstWhere((l) => l.trimLeft().startsWith('|'), orElse: () => '');
+      expect(header, '| Area | Score |',
+          reason: '$label: Section 1 table header must be exactly two columns');
+    });
+
+    test('has the Overall Score row', () {
+      expect(secLines,
+          contains('| **Overall Score** | **[Score]/100 ([Label])** |'),
+          reason: '$label: Overall Score row missing or reshaped');
+    });
+
+    test(
+        'Scoring Methodology appendix sits before Report Metadata, '
+        'which is the last block', () {
+      final evidence = secLines.indexOf('## 11. Appendix: Evidence Index');
+      final appendix = secLines.indexOf('## Appendix: Scoring Methodology');
+      final metadata = secLines.indexOf('## 12. Report Metadata');
+      expect(appendix, isNot(-1),
+          reason: '$label: missing "## Appendix: Scoring Methodology"');
+      expect(evidence, lessThan(appendix),
+          reason: '$label: appendix must come after section 11');
+      expect(appendix, lessThan(metadata),
+          reason: '$label: appendix must come before Report Metadata');
+      final lastHeading = secLines.lastIndexWhere((l) => l.startsWith('## '));
+      expect(lastHeading, metadata,
+          reason: '$label: Report Metadata must be the last "## " block');
     });
   });
 }

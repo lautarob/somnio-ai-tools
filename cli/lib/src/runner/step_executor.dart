@@ -8,6 +8,7 @@ import 'package:path/path.dart' as p;
 
 import '../utils/platform_utils.dart';
 import '../version.dart';
+import 'drive_upload.dart';
 import 'run_config.dart';
 
 /// Signature for spawning an AI CLI process. Matches [Process.start].
@@ -142,6 +143,17 @@ class StepResult {
   final TokenUsage? tokenUsage;
 }
 
+/// Result of [StepExecutor.executeDriveUpload].
+class DriveUploadStepResult {
+  const DriveUploadStepResult(this.step, {this.upload});
+
+  /// Timing, token usage and process errors of the upload step.
+  final StepResult step;
+
+  /// What the upload step reported, or `null` when it wrote no valid result.
+  final DriveUploadResult? upload;
+}
+
 /// Executes individual plan steps by invoking an AI CLI in a fresh context.
 ///
 /// Each step spawns a separate process using [AgentConfig.buildArgs],
@@ -250,9 +262,7 @@ class StepExecutor {
         tokenUsage: usage,
         errorMessage: result.exitCode != 0
             ? _describeProcessError(result, effectiveModel)
-            : (!artifactExists
-                ? 'Artifact not created: $artifactPath'
-                : null),
+            : (!artifactExists ? 'Artifact not created: $artifactPath' : null),
       );
     } on StepTimeoutException catch (e) {
       stopwatch.stop();
@@ -357,9 +367,7 @@ class StepExecutor {
         tokenUsage: usage,
         errorMessage: result.exitCode != 0
             ? _describeProcessError(result, effectiveModel)
-            : (!reportExists
-                ? 'Report not created: $reportPath'
-                : null),
+            : (!reportExists ? 'Report not created: $reportPath' : null),
       );
     } on StepTimeoutException catch (e) {
       stopwatch.stop();
@@ -379,6 +387,102 @@ class StepExecutor {
         durationSeconds: stopwatch.elapsed.inSeconds,
         errorMessage: 'Process error: $e',
       );
+    }
+  }
+
+  /// Uploads the generated report to the Drive folder [folderId] through the
+  /// agent's Google Drive MCP tools (`somnio run --upload`).
+  ///
+  /// The step follows `references/drive-upload.md` in CLI mode and writes its
+  /// outcome to `drive_upload.json` in the artifacts directory. Only this
+  /// step runs with [AgentConfig.driveUploadApproveFlags]. The returned
+  /// [DriveUploadStepResult.upload] is `null` when the step wrote no valid
+  /// result; the caller still has to check an `uploaded` result with
+  /// [verifyDriveUpload].
+  Future<DriveUploadStepResult> executeDriveUpload({
+    required String folderId,
+    bool replace = false,
+  }) async {
+    final stopwatch = Stopwatch()..start();
+    final reportPath = config.reportPath;
+    final resultPath = p.join(config.artifactsDir, 'drive_upload.json');
+    final step = ExecutionStep(index: 0, ruleName: driveUploadRuleName);
+
+    StepResult failure(String message) {
+      stopwatch.stop();
+      return StepResult(
+        step: step,
+        success: false,
+        artifactPath: resultPath,
+        durationSeconds: stopwatch.elapsed.inSeconds,
+        errorMessage: message,
+      );
+    }
+
+    final ruleFile = _ruleFilePath(driveUploadRuleName);
+    if (!File(ruleFile).existsSync()) {
+      return DriveUploadStepResult(
+        failure(
+          'Upload instructions not found: $ruleFile. '
+          'Run `somnio skills update` and retry.',
+        ),
+      );
+    }
+    if (!File(reportPath).existsSync()) {
+      return DriveUploadStepResult(
+        failure('Report not found for upload: $reportPath'),
+      );
+    }
+
+    final resultFile = File(resultPath);
+    if (resultFile.existsSync()) resultFile.deleteSync();
+
+    final prompt = buildDriveUploadPrompt(
+      readInstruction: config.agentConfig.formatReadInstruction(ruleFile),
+      reportPath: reportPath,
+      folderId: folderId,
+      resultPath: resultPath,
+      replace: replace,
+    );
+
+    try {
+      final result = await _runProcess(
+        prompt,
+        modelOverride: config.model,
+        approveFlags: config.agentConfig.driveUploadApproveFlags,
+      );
+      stopwatch.stop();
+      final usage = _parseTokenUsage(result.stdout as String);
+
+      DriveUploadResult? upload;
+      String? resultError;
+      if (resultFile.existsSync()) {
+        try {
+          upload = DriveUploadResult.fromJson(resultFile.readAsStringSync());
+        } on FormatException catch (e) {
+          resultError = 'Invalid upload result in $resultPath: ${e.message}';
+        }
+      } else {
+        resultError = 'The upload step wrote no result: $resultPath';
+      }
+
+      return DriveUploadStepResult(
+        StepResult(
+          step: step,
+          success: result.exitCode == 0 && upload != null,
+          artifactPath: resultPath,
+          durationSeconds: stopwatch.elapsed.inSeconds,
+          tokenUsage: usage,
+          errorMessage: result.exitCode != 0
+              ? _describeProcessError(result, config.model)
+              : resultError,
+        ),
+        upload: upload,
+      );
+    } on StepTimeoutException catch (e) {
+      return DriveUploadStepResult(failure(e.message));
+    } catch (e) {
+      return DriveUploadStepResult(failure('Process error: $e'));
     }
   }
 
@@ -548,8 +652,7 @@ class StepExecutor {
     String ruleFile,
     String artifactPath,
   ) {
-    final readInstruction =
-        config.agentConfig.formatReadInstruction(ruleFile);
+    final readInstruction = config.agentConfig.formatReadInstruction(ruleFile);
 
     return 'You are executing step ${step.index} of ${config.steps.length} '
         'in the ${config.displayName}.\n\n'
@@ -578,8 +681,7 @@ class StepExecutor {
     String ruleFile,
     String reportPath,
   ) {
-    final readInstruction =
-        config.agentConfig.formatReadInstruction(ruleFile);
+    final readInstruction = config.agentConfig.formatReadInstruction(ruleFile);
 
     final reportDir = p.dirname(reportPath);
 
@@ -639,8 +741,7 @@ class StepExecutor {
   /// a fixed band list or a fixed score-line format here — send the model
   /// back to the skill's own template and rule file, which differ per skill.
   String _buildFormatEnforcerPrompt(String ruleFile, String reportPath) {
-    final readInstruction =
-        config.agentConfig.formatReadInstruction(ruleFile);
+    final readInstruction = config.agentConfig.formatReadInstruction(ruleFile);
 
     return 'You are validating and enforcing formatting on the '
         '${config.displayName} report.\n\n'
@@ -691,18 +792,22 @@ class StepExecutor {
     String prompt, {
     String? modelOverride,
     String? artifactPath,
+    List<String>? approveFlags,
   }) async {
     final model = modelOverride ?? config.model;
     final agent = config.agentConfig;
-    final args = agent.buildArgs(prompt, model: model);
+    final args = agent.buildArgs(
+      prompt,
+      model: model,
+      approveFlags: approveFlags,
+    );
     final executable = await _resolveExecutable();
     return runBoundedProcess(
       executable,
       args,
       workingDirectory: Directory.current.path,
-      environment: artifactPath == null
-          ? null
-          : {'SOMNIO_ARTIFACT_FILE': artifactPath},
+      environment:
+          artifactPath == null ? null : {'SOMNIO_ARTIFACT_FILE': artifactPath},
       timeout: stepTimeout,
       processStarter: _processStarter,
     );

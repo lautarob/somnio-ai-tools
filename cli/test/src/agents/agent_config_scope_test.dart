@@ -1,4 +1,8 @@
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
 import 'package:somnio/src/agents/agent_config.dart';
+import 'package:somnio/src/utils/real_path.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -119,6 +123,247 @@ void main() {
       expect(
         project,
         '/Users/me/projects/app/.claude/skills/security-audit',
+      );
+    });
+  });
+  group('resolvedScopedLegacyInstallPath', () {
+    const moved = AgentConfig(
+      id: 'antigravity',
+      displayName: 'Antigravity',
+      installPath: '{home}/.gemini/config/skills',
+      legacyInstallPath: '{home}/.gemini/antigravity',
+      configHome: '{home}/.gemini',
+      configHomeVariable: 'TEST_GEMINI_HOME',
+    );
+
+    test('anchors at home for the global scope', () {
+      expect(
+        moved.resolvedScopedLegacyInstallPath(
+          scope: InstallScope.global,
+          home: '/Users/me',
+          projectRoot: '/Users/me/app',
+        ),
+        '/Users/me/.gemini/antigravity',
+      );
+    });
+
+    test('anchors at the project root for the project scope', () {
+      expect(
+        moved.resolvedScopedLegacyInstallPath(
+          scope: InstallScope.project,
+          home: '/Users/me',
+          projectRoot: '/Users/me/app',
+        ),
+        '/Users/me/app/.gemini/antigravity',
+      );
+    });
+
+    test('is never relocated by the config-home variable', () {
+      expect(
+        moved.resolvedInstallPath(
+          home: '/Users/me',
+          environment: const {'TEST_GEMINI_HOME': '/custom'},
+        ),
+        '/custom/config/skills',
+      );
+      expect(
+        moved.resolvedScopedLegacyInstallPath(
+          scope: InstallScope.global,
+          home: '/Users/me',
+          projectRoot: '/Users/me/app',
+        ),
+        '/Users/me/.gemini/antigravity',
+      );
+    });
+
+    test('is null for an agent that never moved', () {
+      const agent = AgentConfig(
+        id: 'claude',
+        displayName: 'Claude Code',
+        installPath: '{home}/.claude/skills',
+      );
+
+      expect(
+        agent.resolvedScopedLegacyInstallPath(
+          scope: InstallScope.global,
+          home: '/Users/me',
+          projectRoot: '/Users/me/app',
+        ),
+        isNull,
+      );
+    });
+  });
+
+  group('config-home override', () {
+    const agent = AgentConfig(
+      id: 'codex',
+      displayName: 'Codex CLI',
+      installPath: '{home}/.codex/skills',
+      configHome: '{home}/.codex',
+      configHomeVariable: 'CODEX_HOME',
+      legacyExecutionRulesPath: '{home}/.codex/somnio_rules',
+    );
+    const environment = {'CODEX_HOME': '/opt/codex'};
+
+    test('relocates the global install path', () {
+      final resolved = agent.resolvedScopedInstallPath(
+        scope: InstallScope.global,
+        home: '/Users/me',
+        projectRoot: '/Users/me/projects/app',
+        environment: environment,
+      );
+
+      expect(resolved, '/opt/codex/skills');
+    });
+
+    test('keeps the legacy rules path where older releases wrote it', () {
+      final resolved = agent.resolvedScopedExecutionRulesPath(
+        scope: InstallScope.global,
+        home: '/Users/me',
+        projectRoot: '/Users/me/projects/app',
+        environment: environment,
+      );
+
+      expect(resolved, '/Users/me/.codex/somnio_rules');
+    });
+
+    test('lists the default install path after the relocated one', () {
+      expect(
+        agent.resolvedGlobalInstallPaths(
+          home: '/Users/me',
+          environment: environment,
+        ),
+        ['/opt/codex/skills', '/Users/me/.codex/skills'],
+      );
+      expect(
+        agent.resolvedGlobalInstallPaths(home: '/Users/me'),
+        ['/Users/me/.codex/skills'],
+      );
+    });
+
+    test('leaves the default install path out when it may be in use', () {
+      const shared = AgentConfig(
+        id: 'claude',
+        displayName: 'Claude Code',
+        installPath: '{home}/.claude/skills',
+        configHome: '{home}/.claude',
+        configHomeVariable: 'CLAUDE_CONFIG_DIR',
+        cleansDefaultConfigHome: false,
+      );
+
+      expect(
+        shared.resolvedGlobalInstallPaths(
+          home: '/Users/me',
+          environment: const {'CLAUDE_CONFIG_DIR': '/Users/me/.claude-work'},
+        ),
+        ['/Users/me/.claude-work/skills'],
+      );
+    });
+
+    group('resolvedProtectedInstallPaths', () {
+      late Directory home;
+
+      setUp(() => home = Directory.systemTemp.createTempSync('protected_'));
+      tearDown(() => home.deleteSync(recursive: true));
+
+      const shared = AgentConfig(
+        id: 'claude',
+        displayName: 'Claude Code',
+        installPath: '{home}/.claude/skills',
+        configHome: '{home}/.claude',
+        configHomeVariable: 'CLAUDE_CONFIG_DIR',
+        cleansDefaultConfigHome: false,
+      );
+
+      test('lists the default location while the variable relocates it', () {
+        expect(
+          shared.resolvedProtectedInstallPaths(
+            home: home.path,
+            environment: {
+              'CLAUDE_CONFIG_DIR': p.join(home.path, '.claude-work'),
+            },
+          ),
+          [realPathOf(p.join(home.path, '.claude', 'skills'))],
+        );
+      });
+
+      test('is empty without the variable or with cleanup allowed', () {
+        expect(shared.resolvedProtectedInstallPaths(home: home.path), isEmpty);
+        expect(
+          agent.resolvedProtectedInstallPaths(
+            home: home.path,
+            environment: environment,
+          ),
+          isEmpty,
+        );
+      });
+
+      test('is empty when the variable links to the default location', () {
+        Directory(p.join(home.path, '.claude')).createSync();
+        Link(p.join(home.path, '.claude-link'))
+            .createSync(p.join(home.path, '.claude'));
+
+        expect(
+          shared.resolvedProtectedInstallPaths(
+            home: home.path,
+            environment: {
+              'CLAUDE_CONFIG_DIR': p.join(home.path, '.claude-link'),
+            },
+          ),
+          isEmpty,
+        );
+      });
+    });
+
+    test('is ignored for the project scope', () {
+      final resolved = agent.resolvedScopedInstallPath(
+        scope: InstallScope.project,
+        home: '/Users/me',
+        projectRoot: '/Users/me/projects/app',
+        environment: environment,
+      );
+
+      expect(resolved, '/Users/me/projects/app/.codex/skills');
+    });
+
+    test('is ignored when the variable is unset or blank', () {
+      for (final env in const [
+        <String, String>{},
+        {'CODEX_HOME': ''},
+        {'CODEX_HOME': '   '},
+      ]) {
+        expect(
+          agent.resolvedInstallPath(home: '/Users/me', environment: env),
+          '/Users/me/.codex/skills',
+          reason: '$env',
+        );
+      }
+    });
+
+    test('resolves the config home itself', () {
+      expect(
+        agent.resolvedConfigHome(home: '/Users/me', environment: environment),
+        '/opt/codex',
+      );
+      expect(agent.resolvedConfigHome(home: '/Users/me'), '/Users/me/.codex');
+      expect(
+        const AgentConfig(id: 'x', displayName: 'X', installPath: '{home}/.x')
+            .resolvedConfigHome(home: '/Users/me', environment: environment),
+        isNull,
+      );
+    });
+
+    test('does not apply without a configHome prefix', () {
+      const noPrefix = AgentConfig(
+        id: 'x',
+        displayName: 'X',
+        installPath: '{home}/.x/skills',
+        configHomeVariable: 'CODEX_HOME',
+      );
+
+      expect(
+        noPrefix.resolvedInstallPath(home: '/h', environment: environment),
+        '/h/.x/skills',
       );
     });
   });

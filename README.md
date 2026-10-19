@@ -6,7 +6,6 @@
 
 Run comprehensive health audits, security scans, and best-practices checks on Flutter, NestJS, React, Python (FastAPI, Django, Flask), and more — directly from your AI coding assistant.
 
-[![Install Somnio Skills](https://img.shields.io/badge/skills.sh-Install%20Somnio%20Skills-blue?style=for-the-badge)](https://skills.sh/somnio-software/somnio-ai-tools)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
 [![Flutter](https://img.shields.io/badge/Flutter-02569B?style=flat-square&logo=flutter&logoColor=white)](#)
@@ -21,11 +20,26 @@ Run comprehensive health audits, security scans, and best-practices checks on Fl
 
 ## Quick Install
 
+Install the Somnio CLI (requires the Dart SDK 3.0+), then let it install the skills:
+
 ```bash
-npx skills add somnio-software/somnio-ai-tools
+dart pub global activate -sgit https://github.com/somnio-software/somnio-ai-tools.git --git-path cli
+somnio setup
 ```
 
-> Works with Claude Code, Cursor, Windsurf, Copilot, and [40+ other agents](https://agentskills.io).
+The CLI installs skills with its own installer (not skills.sh), records them in a manifest, and offers to remove Somnio skills previously installed by skills.sh, so `somnio skills update` can keep everything current. It also runs the multi-step audits (`somnio run <alias>`). Reports you share must come from `somnio run` or a current install; see [Sharing reports](docs/cli.md#sharing-reports). Add `--upload` to upload the report to the project's Drive folder ([Uploading reports to Drive](docs/cli.md#uploading-reports-to-drive)).
+
+### Keeping up to date
+
+The CLI and the installed skills update separately. Run both after every release:
+
+```bash
+somnio update          # update the CLI binary; prints "CLI updated to vX.Y.Z"
+somnio skills update   # refresh installed skills; lists the skills it updated
+somnio status          # check the CLI version against each installed skill's stamp
+```
+
+`somnio run` refuses to start when the installed skills were stamped by a different CLI version, and tells you to run `somnio skills update` first.
 
 <details>
 <summary><strong>Claude Desktop App (Cowork plugin)</strong></summary>
@@ -33,18 +47,6 @@ npx skills add somnio-software/somnio-ai-tools
 1. Open **Claude Desktop App** → **Cowork** tab → **Customize** → **Explore Plugins**
 2. Go to **Personal**, click **+**, paste `somnio-software/somnio-ai-tools`
 3. Select which plugins to install from the marketplace
-
-</details>
-
-<details>
-<summary><strong>Somnio CLI</strong> (includes multi-step audit runner)</summary>
-
-```bash
-dart pub global activate -sgit https://github.com/somnio-software/somnio-ai-tools.git --git-path cli
-somnio setup
-```
-
-The CLI installs skills with its own installer (not skills.sh) and offers to remove Somnio skills previously installed by skills.sh, so `somnio skills update` can keep everything current.
 
 </details>
 
@@ -62,16 +64,18 @@ The CLI installs skills with its own installer (not skills.sh) and offers to rem
 | [Harness Audit](docs/skills.md#harness-audit) | `ha` | AI-harness completeness score (CLAUDE.md, rules, hooks, agents) |
 | [Flutter Best Practices](docs/skills.md#flutter-best-practices) | `fp` | Code quality validation against live GitHub standards |
 | [Angular Health Audit](docs/skills.md#angular-health-audit) | `ah` | 13-step modern Angular (2+) health audit with weighted scoring |
-| [NestJS Health Audit](docs/skills.md#nestjs-health-audit) | `nh` | 13-step backend health audit with weighted scoring |
+| [NestJS Health Audit](docs/skills.md#nestjs-health-audit) | `nh` | 14-step backend health audit with weighted scoring |
 | [NestJS Best Practices](docs/skills.md#nestjs-best-practices) | `np` | DTO, architecture, and error handling validation |
 | [SOC 2 Readiness Audit](docs/skills.md#soc-2-readiness-audit) | `s2` | Whole-project SOC 2 Trust Services Criteria readiness & gap analysis |
 | [React Health Audit](docs/skills.md#react-health-audit) | `rh` | 13-step frontend health audit with weighted scoring |
 | [React Best Practices](docs/skills.md#react-best-practices) | `rp` | Component, hooks, state management, and TypeScript validation |
 | [AngularJS Best Practices](docs/skills.md#angularjs-best-practices) | `ajp` | AngularJS 1.x code-quality validation (DI-safety, digest, testing) |
 | [AngularJS Health Audit](docs/skills.md#angularjs-health-audit) | `ajh` | 13-step legacy AngularJS 1.x health audit with weighted scoring |
-| [Python Health Audit](docs/skills.md#python-health-audit) | `ph` | 13-step project health audit with weighted scoring |
+| [Python Health Audit](docs/skills.md#python-health-audit) | `ph` | 14-step project health audit with weighted scoring |
 | [Python Best Practices](docs/skills.md#python-best-practices) | `pp` | Code style, typing, function design, and testing validation |
 | [Angular Best Practices](docs/skills.md#angular-best-practices) | `ap` | Angular 2+ code-quality validation (RxJS, change detection, TS) |
+| [.NET Health Audit](docs/skills.md#net-health-audit) | `dh` | .NET / ASP.NET Core Web API health audit with weighted scoring |
+| [.NET Best Practices](docs/skills.md#net-best-practices) | `dp` | Testing, architecture, SOLID, DTO validation, and error handling validation |
 | [Security Audit](docs/skills.md#security-audit) | `sa` | Framework-agnostic security scan (secrets, deps, SAST) |
 | [ISO 27001 Readiness Audit](docs/skills.md#iso-27001-readiness-audit) | `iso` | Whole-project ISO/IEC 27001:2022 ISMS & Annex A readiness & gap analysis |
 
@@ -81,9 +85,9 @@ The CLI installs skills with its own installer (not skills.sh) and offers to rem
 |:------|:------------|
 | [Clockify Tracker](docs/skills.md#clockify-tracker) | Log time manually or auto-fill from daily work logs — two modes, full preview before posting |
 | [Workflow Builder](docs/skills.md#workflow-builder) | Custom multi-step AI workflows with parallel execution |
-| [Ship](docs/skills.md#ship) | Automated ship workflow: merge, test, bump, changelog, commit, push, open PR |
 | [Git Branch Format](docs/skills.md#git-branch-format) | Branch naming convention generator |
 | [Git Commit Format](docs/skills.md#git-commit-format) | Conventional Commits message generator |
+| [Git PR Format](docs/skills.md#git-pr-format) | Pull request title and description generator, with no AI attribution |
 | [Dart Model from JSON](docs/skills.md#dart-model-from-json) | Generate Dart model classes from a JSON structure with json_annotation + equatable |
 | [Optimize Claude Config](docs/skills.md#optimize-claude-config) | Audit & optimize a repo's Claude Code config for lazy-loading rules and a lean CLAUDE.md |
 | [DORA Metrics](docs/skills.md#dora-metrics) | Deployment Frequency and Lead Time for Changes, per project and per repo, from GitHub, GitLab, or Bitbucket |
@@ -108,6 +112,22 @@ somnio hooks --force    # skip confirmation
 ```
 
 > [Hook details →](docs/work-log-stop-hook.md) · [CLI reference →](docs/cli.md)
+
+---
+
+## Claude Code Attribution
+
+Claude Code adds a `Co-Authored-By` trailer to commits and a "🤖 Generated with Claude Code" footer to pull requests by default. Turn both off in `~/.claude/settings.json` with one command:
+
+```bash
+somnio attribution off      # remove the trailer and the footer
+somnio attribution on       # restore Claude Code's default
+somnio attribution status   # show the current state
+```
+
+`somnio setup` offers to do this when it installs skills for Claude Code.
+
+> [CLI reference →](docs/cli.md#somnio-attribution)
 
 ---
 
@@ -182,7 +202,7 @@ Somnio ships as a Claude Desktop App plugin (Cowork):
 
 ### Utility CLIs
 
-Separate binaries that add commands to Claude Code. These are not marketplace plugins and do not install via `npx skills add`. You install each one directly.
+Separate binaries that add commands to Claude Code. These are not marketplace plugins. You install each one directly.
 
 | Tool | What it does |
 |:-----|:-------------|

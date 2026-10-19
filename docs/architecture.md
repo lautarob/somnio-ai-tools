@@ -9,7 +9,7 @@ User
  │
  ├─ AI Agent (Claude Code, Cursor, Gemini, ...)
  │   │
- │   └─ Skills (installed via skills.sh, plugin or the Somnio CLI)
+ │   └─ Skills (installed via plugin or the Somnio CLI)
  │       ├─ Audit skills → multi-step analysis → reports
  │       ├─ Utility skills → Git formatting, etc.
  │       └─ Workflow skills → custom pipelines
@@ -31,11 +31,10 @@ Skills can be invoked in two ways:
 
 | Channel | Method | Scope |
 |---------|--------|-------|
-| **skills.sh** | `npx skills add somnio-software/somnio-ai-tools` | 40+ agents |
-| **Claude Desktop App** | Cowork → Explore Plugins → Personal → add `somnio-software/somnio-ai-tools` | Claude Desktop App |
 | **Somnio CLI** | `somnio setup` (built-in, manifest-tracked installer) | All detected CLIs |
+| **Claude Desktop App** | Cowork → Explore Plugins → Personal → add `somnio-software/somnio-ai-tools` | Claude Desktop App |
 
-All three channels install the same skills. The CLI additionally provides the multi-step audit runner. The CLI does not use skills.sh; it removes Somnio skills a previous skills.sh install left in the global scope (see **skills.sh Cleaner** below).
+Both channels install the same skills. The CLI additionally provides the multi-step audit runner. skills.sh is not a distribution channel; the CLI removes Somnio skills a previous skills.sh install left in the global scope (see **skills.sh Cleaner** below).
 
 ---
 
@@ -49,6 +48,7 @@ cli/lib/src/
 ├── installers/      # File writers (agent-specific install paths)
 ├── runner/          # Audit execution engine
 │   ├── agent_resolver.dart   # Auto-detect available AI CLIs
+│   ├── drive_upload.dart     # --upload: folder prefs, result check
 │   ├── plan_parser.dart      # Extract steps from SKILL.md
 │   ├── preflight.dart        # Pre-flight steps (no AI needed)
 │   └── step_executor.dart    # Spawn fresh AI CLI per step
@@ -70,12 +70,12 @@ cli/lib/src/
 
 | Format | Agent | Output |
 |--------|-------|--------|
-| `skillDir` | Claude Code | Directory with SKILL.md + rule files |
+| `skillDir` | Claude Code, Codex, Gemini CLI, Antigravity, Augment Code, OpenCode, Cline, CodeBuddy, Qwen CLI | `<name>/` directory with SKILL.md (frontmatter) + references/, assets/, agents/ |
 | `singleFile` | Cursor | Single merged markdown file |
-| `workflow` | Gemini/Antigravity | Workflow YAML format |
-| `markdown` | Generic | Standard markdown |
+| `workflow` | none (Antigravity before 3.2.15; kept as its `legacyInstallFormat`) | `global_workflows/somnio_<name>.md` + `somnio_rules/` |
+| `markdown` | Amp, Aider, Copilot, Windsurf, Roo, Kilo, Amazon Q | Standard markdown |
 
-**Installers** — Write transformed skills to agent-specific locations (`~/.claude/skills/`, `~/.cursor/commands/`, etc.). `AgentInstaller` resolves its target through `InstallScope`: `global` anchors the path template's `{home}` placeholder at the user's home directory, `project` anchors it at the current project root (`./.claude/skills/`). Only agents whose `installPath` is home-relative expose a project scope (`AgentConfig.supportsProjectScope`).
+**Installers** — Write transformed skills to agent-specific locations (`~/.claude/skills/`, `~/.codex/skills/`, `~/.cursor/commands/`, etc.). An agent's `configHome` + `configHomeVariable` relocate its global install path when the variable is set (Codex: `$CODEX_HOME/skills`, Claude Code: `$CLAUDE_CONFIG_DIR/skills`). An agent that changed format keeps its old layout in `legacyInstallFormat` / `legacyExecutionRulesPath`: when a reinstall writes paths the previous manifest entry did not have, `AgentInstaller` deletes the recorded paths it no longer writes (never one overlapping a new path) and removes the legacy rules directory once it is empty, and remove/uninstall resolve old `rules` entries against that directory. An agent whose install directory moved also sets `legacyInstallPath` (Antigravity: `~/.gemini/antigravity` → `~/.gemini/config/skills`): the old location keeps its own manifest, so on reinstall `AgentInstaller` deletes what that manifest records for each skill it just wrote and drops the entry, skills update/remove and uninstall also read that manifest, and agent detection also checks that folder. `AgentInstaller` resolves its target through `InstallScope`: `global` anchors the path template's `{home}` placeholder at the user's home directory, `project` anchors it at the current project root (`./.claude/skills/`). Only agents whose `installPath` is home-relative expose a project scope (`AgentConfig.supportsProjectScope`).
 
 **Skill Manifest** (`installers/skill_manifest.dart`) — Every install writes a `.somnio-skills.json` at the root of the target directory, recording the exact relative paths written per skill (tagged by which root they belong to — the install dir or the agent's separate `executionRulesPath`). One manifest per agent and scope. This is what makes `somnio skills update` and `somnio skills remove` exact: they act only on recorded paths instead of guessing ownership by matching names against the registry, so user-authored skills sharing a name are never modified or deleted. A missing or corrupt manifest reads as empty rather than throwing, so a bad file can't wedge the install commands.
 
@@ -109,6 +109,7 @@ When running from the terminal:
 5. **Parse SKILL.md** — extract step order from "Rule Execution Order" section
 6. **Execute each step** — spawn a fresh AI CLI process with the step prompt, save output to `./reports/.artifacts/<skill-name>/`
 7. **Generate report** — combine artifacts into the final report at `./reports/<YYYY-MM-DD>-<project>-<skill-name>.md`
+8. **Upload to Drive** (only with `--upload`) — one more AI step follows the skill's `references/drive-upload.md` with `AgentConfig.driveUploadApproveFlags`, the only step allowed to call the Google Drive MCP; the CLI then checks its `drive_upload.json` against the local report. See [Uploading reports to Drive](cli.md#uploading-reports-to-drive)
 
 Each step runs in a **fresh AI context** to avoid context window exhaustion on large audits. This is a deliberate design choice — audits of up to 14 steps (flutter: 12, nestjs/python/react: 14) would exceed context limits in a single session.
 
@@ -144,7 +145,7 @@ This means:
 
 **Data-driven agent registry** — Instead of if/else chains for each agent, a single `AgentConfig` model captures all agent differences (binary name, prompt style, install format, models). This makes the codebase scale linearly as new agents are added.
 
-**Own installer, not skills.sh** — skills.sh stays a distribution channel for people who don't use the CLI, but the CLI installs with its own data-driven installer so every install is recorded in the manifest and can be updated and removed exactly. Mixing both left untracked, stale copies, which is why the CLI cleans up Somnio skills installed by skills.sh.
+**Own installer, not skills.sh** — the CLI is the distribution channel and installs with its own data-driven installer so every install is recorded in the manifest and can be updated and removed exactly. Legacy skills.sh installs were untracked and went stale, which is why the CLI cleans up Somnio skills a previous skills.sh install left behind.
 
 **Markdown-based skills** — Skills are plain markdown files, not code. This makes them readable, editable, and portable across any agent that supports markdown-based skill systems.
 

@@ -4,6 +4,22 @@ import 'package:test/test.dart';
 
 void main() {
   group('AgentRegistry', () {
+    test('only Claude Code can upload reports from somnio run', () {
+      final uploaders = AgentRegistry.agents
+          .where((a) => a.supportsDriveUpload)
+          .map((a) => a.id);
+      expect(uploaders, ['claude']);
+
+      final claude = AgentRegistry.findById('claude')!;
+      final tools = claude.driveUploadApproveFlags.last.split(',');
+      expect(tools, containsAll(['ToolSearch', 'mcp__claude_ai_Google_Drive']));
+      expect(
+        tools,
+        containsAll(claude.autoApproveFlags.last.split(',')),
+        reason: 'the upload step keeps the regular step tools',
+      );
+    });
+
     test('agents list is not empty', () {
       expect(AgentRegistry.agents, isNotEmpty);
     });
@@ -53,8 +69,8 @@ void main() {
     });
 
     test('installableAgents returns all agents', () {
-      expect(AgentRegistry.installableAgents.length,
-          AgentRegistry.agents.length);
+      expect(
+          AgentRegistry.installableAgents.length, AgentRegistry.agents.length);
     });
 
     test('ideAgents only includes non-executable agents', () {
@@ -104,6 +120,38 @@ void main() {
       expect(claude.models, contains('haiku'));
     });
 
+    test('claude installs skill directories under \$CLAUDE_CONFIG_DIR/skills',
+        () {
+      final claude = AgentRegistry.findById('claude')!;
+      expect(
+        claude.resolvedInstallPath(home: '/h', environment: const {}),
+        '/h/.claude/skills',
+      );
+      expect(
+        claude.resolvedInstallPath(
+          home: '/h',
+          environment: const {'CLAUDE_CONFIG_DIR': '/h/.claude-work'},
+        ),
+        '/h/.claude-work/skills',
+      );
+      expect(
+        claude.resolvedScopedInstallPath(
+          scope: InstallScope.project,
+          home: '/h',
+          projectRoot: '/repo',
+          environment: const {'CLAUDE_CONFIG_DIR': '/h/.claude-work'},
+        ),
+        '/repo/.claude/skills',
+      );
+      expect(
+        claude.resolvedGlobalInstallPaths(
+          home: '/h',
+          environment: const {'CLAUDE_CONFIG_DIR': '/h/.claude-work'},
+        ),
+        ['/h/.claude-work/skills'],
+      );
+    });
+
     test('cursor has correct configuration', () {
       final cursor = AgentRegistry.findById('cursor')!;
       expect(cursor.promptStyle, PromptStyle.positionalLast);
@@ -116,25 +164,92 @@ void main() {
       final gemini = AgentRegistry.findById('gemini')!;
       expect(gemini.promptStyle, PromptStyle.flag);
       expect(gemini.promptFlag, '-p');
-      expect(gemini.installFormat, InstallFormat.markdown);
+      expect(gemini.installFormat, InstallFormat.skillDir);
       expect(gemini.tokenUsageParser, isNotNull);
     });
 
-    test('antigravity has correct configuration', () {
+    test('antigravity installs skill directories, not workflows', () {
+      // Antigravity IDE workflows stop working on 2026-10-19; skills live in
+      // `~/.gemini/config/skills/<name>/SKILL.md`.
       final antigravity = AgentRegistry.findById('antigravity')!;
       expect(antigravity.canExecute, false);
-      expect(antigravity.installFormat, InstallFormat.workflow);
-      expect(antigravity.ruleExtension, '.yaml');
-      expect(antigravity.readInstructionTemplate, isNotNull);
+      expect(antigravity.installFormat, InstallFormat.skillDir);
+      expect(antigravity.executionRulesPath, isNull);
+      expect(antigravity.ruleExtension, '.md');
+      expect(antigravity.readInstructionTemplate, isNull);
+      expect(
+        antigravity.resolvedInstallPath(home: '/h'),
+        '/h/.gemini/config/skills',
+      );
+    });
+
+    test('antigravity records the workflow layout it replaced', () {
+      final antigravity = AgentRegistry.findById('antigravity')!;
+      expect(antigravity.legacyInstallFormat, InstallFormat.workflow);
+      expect(
+        antigravity.resolvedScopedLegacyInstallPath(
+          scope: InstallScope.global,
+          home: '/h',
+          projectRoot: '/p',
+        ),
+        '/h/.gemini/antigravity',
+      );
+      expect(
+        antigravity.resolvedExecutionRulesPath(home: '/h'),
+        '/h/.gemini/antigravity/somnio_rules',
+      );
     });
 
     test('codex has correct configuration', () {
       final codex = AgentRegistry.findById('codex')!;
       expect(codex.promptStyle, PromptStyle.subcommand);
       expect(codex.promptFlag, 'exec');
-      expect(codex.autoApproveFlags, ['--dangerously-bypass-approvals-and-sandbox']);
+      expect(codex.autoApproveFlags,
+          ['--dangerously-bypass-approvals-and-sandbox']);
       expect(codex.outputFlags, ['--json']);
       expect(codex.models, contains('gpt-5.3-codex'));
+    });
+
+    test('codex installs skill directories under \$CODEX_HOME/skills', () {
+      final codex = AgentRegistry.findById('codex')!;
+      expect(codex.installFormat, InstallFormat.skillDir);
+      expect(codex.executionRulesPath, isNull);
+      expect(
+        codex.resolvedInstallPath(home: '/h', environment: const {}),
+        '/h/.codex/skills',
+      );
+      expect(
+        codex.resolvedInstallPath(
+          home: '/h',
+          environment: const {'CODEX_HOME': '/custom/codex'},
+        ),
+        '/custom/codex/skills',
+      );
+    });
+
+    test('agents that load <name>/SKILL.md install skill directories', () {
+      // Each of these only loads `<name>/SKILL.md` directories from its
+      // install path, so the flat markdown files earlier releases wrote there
+      // were never picked up. The old layout stays recorded for migration.
+      for (final id in [
+        'codex',
+        'gemini',
+        'auggie',
+        'opencode',
+        'cline',
+        'codebuddy',
+        'qwen',
+      ]) {
+        final agent = AgentRegistry.findById(id)!;
+        expect(agent.installFormat, InstallFormat.skillDir, reason: id);
+        expect(agent.executionRulesPath, isNull, reason: id);
+        expect(agent.legacyInstallFormat, InstallFormat.markdown, reason: id);
+        expect(
+          agent.legacyExecutionRulesPath,
+          endsWith('/somnio_rules'),
+          reason: id,
+        );
+      }
     });
 
     test('all CLI agents with yolo-style auto-approve', () {

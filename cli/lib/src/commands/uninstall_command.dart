@@ -16,6 +16,7 @@ import '../installers/skills_sh_cleaner.dart';
 import '../utils/package_resolver.dart';
 import '../utils/platform_utils.dart';
 import '../utils/prompts.dart';
+import '../utils/real_path.dart';
 import '../utils/yaml_frontmatter.dart';
 
 /// Uninstalls the somnio CLI itself, optionally taking the installed skills
@@ -122,6 +123,7 @@ class UninstallCommand extends Command<int> {
 
       var removedAnything = removeAgentInstalls(
         home: PlatformUtils.homeDirectory,
+        environment: PlatformUtils.environment,
         onRemoved: _verbose ? _verboseLines.add : null,
         onWarning: _warnings.add,
       );
@@ -131,6 +133,7 @@ class UninstallCommand extends Command<int> {
       removedAnything |= removeManifestTrackedInstalls(
         home: PlatformUtils.homeDirectory,
         projectRoot: Directory.current.path,
+        environment: PlatformUtils.environment,
         onRemoved: _verbose ? _verboseLines.add : null,
       );
 
@@ -368,7 +371,6 @@ class UninstallCommand extends Command<int> {
   }
 }
 
-
 /// Removes every somnio-installed skill, command and workflow for all
 /// registered agents under [home].
 ///
@@ -376,13 +378,17 @@ class UninstallCommand extends Command<int> {
 /// bespoke handling can never drift out of sync with the set the generic
 /// cleanup covers. [_removeGenericInstall] handles any agent whose content
 /// lives directly under its registered `installPath` (by name, and only for
-/// locations without a manifest); only Antigravity, which also writes into
-/// `global_workflows/`, needs its own remover.
+/// locations without a manifest); [_removeWorkflowInstall] additionally
+/// covers the workflow layout (`global_workflows/` + `somnio_rules/`)
+/// Antigravity used before CLI 3.2.15.
 ///
 /// Somnio skills installed by skills.sh are removed first through
 /// [SkillsShCleaner], so only lock-owned Somnio entries go and their agent
 /// links and lock entries are cleaned consistently; [environment] supplies
-/// its env overrides (default: the process environment).
+/// its env overrides (default: the process environment) and agent
+/// config-home overrides such as `CODEX_HOME` (default: none, so a test
+/// rooted at a temp [home] never resolves into the user's real
+/// directories).
 ///
 /// Returns `true` if anything was removed. [onRemoved] receives one message per
 /// removed entry, for `--verbose` output, and [onWarning] one per skills.sh
@@ -395,7 +401,9 @@ bool removeAgentInstalls({
   void Function(String message)? onRemoved,
   void Function(String message)? onWarning,
 }) {
-  final cleaner = SkillsShCleaner(homeDirectory: home, environment: environment);
+  final cleaner =
+      SkillsShCleaner(homeDirectory: home, environment: environment);
+  final env = environment ?? const <String, String>{};
   final skillsSh = cleaner.apply(cleaner.plan());
   final skillsShPaths = [
     ...skillsSh.unlinkedLinks,
@@ -409,12 +417,8 @@ bool removeAgentInstalls({
   var removed = skillsShPaths.isNotEmpty;
 
   for (final agent in AgentRegistry.installableAgents) {
-    removed |= switch (agent.id) {
-      // Workflows live one level down, in global_workflows/.
-      'antigravity' => _removeAntigravityInstall(agent, home, onRemoved) |
-          _removeGenericInstall(agent, home, onRemoved, onWarning),
-      _ => _removeGenericInstall(agent, home, onRemoved, onWarning),
-    };
+    removed |= _removeWorkflowInstall(agent, home, onRemoved) |
+        _removeGenericInstall(agent, home, env, onRemoved, onWarning);
   }
 
   return removed;
@@ -428,6 +432,10 @@ bool removeAgentInstalls({
 /// what catches project-scoped installs (`./.claude/skills/...`) and clears
 /// the manifest bookkeeping the name-based sweep leaves behind.
 ///
+/// [environment] supplies agent config-home overrides such as `CODEX_HOME`
+/// for the global scope; it defaults to none, so a test rooted at a temp
+/// [home] never resolves into the user's real directories.
+///
 /// Returns `true` if anything was removed. [onRemoved] receives one message
 /// per deleted path, for `--verbose` output. Top-level rather than a class
 /// member for the same reason as [removeAgentInstalls]: so it can be tested
@@ -435,22 +443,51 @@ bool removeAgentInstalls({
 bool removeManifestTrackedInstalls({
   required String home,
   required String projectRoot,
+  Map<String, String> environment = const {},
   void Function(String message)? onRemoved,
 }) {
   var removed = false;
 
   for (final agent in AgentRegistry.installableAgents) {
-    final scopes = [
-      InstallScope.global,
-      if (agent.supportsProjectScope) InstallScope.project,
-    ];
-
-    for (final scope in scopes) {
-      final installDir = agent.resolvedScopedInstallPath(
-        scope: scope,
+    String? legacyDir(InstallScope scope) =>
+        agent.resolvedScopedLegacyInstallPath(
+          scope: scope,
+          home: home,
+          projectRoot: projectRoot,
+        );
+    final locations = [
+      for (final dir in agent.resolvedGlobalInstallPaths(
         home: home,
-        projectRoot: projectRoot,
-      );
+        environment: environment,
+      ))
+        (scope: InstallScope.global, dir: dir),
+      if (legacyDir(InstallScope.global) case final dir?)
+        (scope: InstallScope.global, dir: dir),
+      if (agent.supportsProjectScope) ...[
+        (
+          scope: InstallScope.project,
+          dir: agent.resolvedScopedInstallPath(
+            scope: InstallScope.project,
+            home: home,
+            projectRoot: projectRoot,
+          ),
+        ),
+        if (legacyDir(InstallScope.project) case final dir?)
+          (scope: InstallScope.project, dir: dir),
+      ],
+    ];
+    // Run from the home directory, the project scope is the global one,
+    // or a protected default location (another Claude Code account's
+    // ~/.claude) that must be left alone.
+    final seen = {
+      ...agent.resolvedProtectedInstallPaths(
+        home: home,
+        environment: environment,
+      ),
+    };
+
+    for (final (:scope, dir: installDir) in locations) {
+      if (!seen.add(realPathOf(installDir))) continue;
       final manifest = SkillManifest.load(installDir);
       if (manifest.isEmpty) continue;
 
@@ -462,8 +499,10 @@ bool removeManifestTrackedInstalls({
                   scope: scope,
                   home: home,
                   projectRoot: projectRoot,
+                  environment: environment,
                 );
           final target = p.join(base, path.path);
+          if (!isSafelyWithin(base, target)) continue;
           if (_deleteEntity(target)) {
             onRemoved?.call('  Removed: $target');
             removed = true;
@@ -503,12 +542,29 @@ bool _deleteEntity(String path) {
   return false;
 }
 
-bool _removeAntigravityInstall(
+/// Removes the workflow layout (Antigravity before CLI 3.2.15) from [agent]'s
+/// global install directory, or from its legacy one when the agent has
+/// since moved: `somnio_`-prefixed files in `global_workflows/` when no
+/// manifest records them, and the whole somnio-owned `somnio_rules/`.
+///
+/// Does nothing for an agent that never used the workflow layout.
+bool _removeWorkflowInstall(
   AgentConfig agent,
   String home,
   void Function(String)? onRemoved,
 ) {
-  final baseDir = agent.resolvedInstallPath(home: home);
+  final baseDir = switch (agent) {
+    AgentConfig(installFormat: InstallFormat.workflow) =>
+      agent.resolvedInstallPath(home: home),
+    AgentConfig(legacyInstallFormat: InstallFormat.workflow) =>
+      agent.resolvedScopedLegacyInstallPath(
+        scope: InstallScope.global,
+        home: home,
+        projectRoot: home,
+      ),
+    _ => null,
+  };
+  if (baseDir == null) return false;
   var removed = false;
 
   // Remove workflow files — unless a manifest records exactly which ones
@@ -524,7 +580,7 @@ bool _removeAntigravityInstall(
     for (final file in files) {
       final name = p.basename(file.path);
       file.deleteSync();
-      onRemoved?.call('  Removed Antigravity workflow: $name');
+      onRemoved?.call('  Removed ${agent.displayName} workflow: $name');
       removed = true;
     }
   }
@@ -533,7 +589,7 @@ bool _removeAntigravityInstall(
   final rulesDir = Directory(p.join(baseDir, 'somnio_rules'));
   if (rulesDir.existsSync()) {
     rulesDir.deleteSync(recursive: true);
-    onRemoved?.call('  Removed Antigravity rules: somnio_rules/');
+    onRemoved?.call('  Removed ${agent.displayName} rules: somnio_rules/');
     removed = true;
   }
 
@@ -553,14 +609,17 @@ bool _removeAntigravityInstall(
 bool _removeGenericInstall(
   AgentConfig agent,
   String home,
+  Map<String, String> environment,
   void Function(String)? onRemoved,
   void Function(String)? onWarning,
 ) {
-  final location = agent.resolvedInstallPath(home: home);
-  final dir = Directory(location);
-
   var removed = false;
-  if (dir.existsSync() && !_hasManifest(location)) {
+  for (final location in agent.resolvedGlobalInstallPaths(
+    home: home,
+    environment: environment,
+  )) {
+    final dir = Directory(location);
+    if (!dir.existsSync() || _hasManifest(location)) continue;
     for (final entity in dir.listSync(followLinks: false)) {
       final name = p.basename(entity.path);
       if (!InstalledSkillNames.matches(agent, name)) continue;
@@ -580,7 +639,7 @@ bool _removeGenericInstall(
     }
   }
 
-  removed |= _removeExecutionRulesFor(agent, home, onRemoved);
+  removed |= _removeExecutionRulesFor(agent, home, environment, onRemoved);
   return removed;
 }
 
@@ -634,14 +693,21 @@ String? _legacyKeepReason(
 }
 
 /// Removes the somnio-owned execution rules directory written by
-/// `AgentInstaller._installExecutionRules` (e.g. `~/.codex/somnio_rules/`).
+/// `AgentInstaller._installExecutionRules` (e.g. `~/.cursor/somnio_rules/`),
+/// or the one an earlier release wrote (e.g. `~/.codex/somnio_rules/`).
 bool _removeExecutionRulesFor(
   AgentConfig agent,
   String home,
+  Map<String, String> environment,
   void Function(String)? onRemoved,
 ) {
-  if (agent.executionRulesPath == null) return false;
-  final rulesDir = Directory(agent.resolvedExecutionRulesPath(home: home));
+  if (agent.executionRulesPath == null &&
+      agent.legacyExecutionRulesPath == null) {
+    return false;
+  }
+  final rulesDir = Directory(
+    agent.resolvedExecutionRulesPath(home: home, environment: environment),
+  );
   if (!rulesDir.existsSync()) return false;
 
   rulesDir.deleteSync(recursive: true);
